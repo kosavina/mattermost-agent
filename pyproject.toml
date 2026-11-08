@@ -1,0 +1,41 @@
+[project]
+name = "mattermost-agent"
+version = "0.1.0"
+description = "Mattermost listener: matches incoming posts against rules and logs them, in dry run"
+readme = "README.md"
+authors = [
+    { name = "Kirill Savina", email = "99422083+kosavina@users.noreply.github.com" }
+]
+requires-python = "==3.15.2"
+dependencies = [
+    "httpx2>=2.16.0",
+    "pyyaml>=6.0.3",
+    "websockets>=17.4",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+    "ty==0.0.99",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]  # assert is how pytest works; tests use fake secrets
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+
+[tool.ty.terminal]
+error-on-warning = true
