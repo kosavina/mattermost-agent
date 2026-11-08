@@ -26,7 +26,10 @@ type LifecycleEvent = Literal[
     "catchup_start",
     "catchup_done",
     "catchup_truncated",
+    "frame_skipped",
     "shutdown",
+    "stopped",
+    "internal_error",
     "fatal",
 ]
 type Reason = Literal[

@@ -1,11 +1,32 @@
 """Fake Mattermost data for the tests. All names and ids are made up."""
 
+import io
 import json
+import logging
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any
 
+from mattermost_agent import logs
 from mattermost_agent.events import Me, Post
 
 ME = Me(user_id="me-id", username="example.me")
+
+
+@contextmanager
+def captured_logs(level: str = "INFO") -> Generator[io.StringIO]:
+    """Configure logging like production, then put the loggers back for the other tests."""
+    loggers = [logging.getLogger(name) for name in (logs.LOGGER_NAME, *logs.LIBRARY_LOGGERS)]
+    saved = [(logger, logger.handlers[:], logger.level, logger.propagate) for logger in loggers]
+    stream = io.StringIO()
+    logs.configure_logging(level, stream)
+    try:
+        yield stream
+    finally:
+        for logger, handlers, logger_level, propagate in saved:
+            logger.handlers[:] = handlers
+            logger.setLevel(logger_level)
+            logger.propagate = propagate
 
 
 def raw_post(**fields: Any) -> dict[str, Any]:

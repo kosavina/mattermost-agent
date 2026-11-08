@@ -134,7 +134,7 @@ def _mentions(data: dict[str, object]) -> frozenset[str]:
     return frozenset(_text_list(_decoded(raw, "mentions"), "mentions"))
 
 
-def parse_websocket_message(frame: str) -> Post | None:
+def parse_websocket_message(frame: object) -> Post | None:
     """Return the post of a `posted` event, None for any other event, or raise MalformedEvent."""
     event = _mapping(_decoded(frame, "event"), "event")
     if event.get("event") != "posted":
