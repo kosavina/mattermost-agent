@@ -7,8 +7,12 @@ from helpers import make_post, posted_event, raw_post
 from mattermost_agent.events import (
     Channel,
     MalformedEvent,
+    Me,
+    is_hello,
     parse_channel,
+    parse_channel_list,
     parse_post_page,
+    parse_user,
     parse_websocket_message,
 )
 
@@ -106,6 +110,35 @@ def test_errors_do_not_quote_the_message() -> None:
 
 def test_repr_leaves_out_the_text() -> None:
     assert SECRET not in repr(make_post(message=SECRET))
+
+
+def test_user() -> None:
+    assert parse_user({"id": "u", "username": "example.user", "email": "x"}) == Me(
+        user_id="u", username="example.user"
+    )
+
+
+@pytest.mark.parametrize("body", [{}, [], {"id": "u"}, {"id": "u", "username": ""}])
+def test_malformed_user_is_refused(body: object) -> None:
+    with pytest.raises(MalformedEvent):
+        parse_user(body)
+
+
+def test_hello_is_recognised() -> None:
+    assert is_hello(json.dumps({"event": "hello", "data": {}}))
+    assert not is_hello(json.dumps({"event": "posted", "data": {}}))
+    assert not is_hello(json.dumps({"status": "OK"}))
+
+
+def test_channel_list() -> None:
+    row = {"id": "c", "name": "n", "type": "D"}
+    assert [channel.id for channel in parse_channel_list([row])] == ["c"]
+
+
+@pytest.mark.parametrize("body", [{}, "text", [[]]])
+def test_malformed_channel_list_is_refused(body: object) -> None:
+    with pytest.raises(MalformedEvent):
+        parse_channel_list(body)
 
 
 def test_channel_row() -> None:

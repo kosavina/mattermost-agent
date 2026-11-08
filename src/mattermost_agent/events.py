@@ -159,6 +159,24 @@ def parse_channel(raw: object) -> Channel:
     )
 
 
+def parse_channel_list(body: object) -> list[Channel]:
+    """Return the whole channel listing."""
+    if not isinstance(body, list):
+        raise MalformedEvent("channel list is not a list")
+    return [parse_channel(row) for row in body]
+
+
+def parse_user(body: object) -> Me:
+    """Return the id and username of one user."""
+    user = _mapping(body, "user")
+    return Me(user_id=_text(user, "id"), username=_text(user, "username"))
+
+
+def is_hello(frame: object) -> bool:
+    """Say whether a WebSocket frame is the server's greeting."""
+    return _mapping(_decoded(frame, "event"), "event").get("event") == "hello"
+
+
 def parse_post_page(body: object, channel: Channel) -> list[Post]:
     """Return the posts of one REST page, in the server's order: newest first."""
     page = _mapping(body, "page")
