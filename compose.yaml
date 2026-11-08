@@ -1,0 +1,42 @@
+# Run the listener. Needs a .env next to this file with MM_URL and IMAGE_TAG (see the README),
+# a rules.yaml, and the token in secrets/mm_token. The token never goes in .env.
+name: mattermost-agent
+
+services:
+  agent:
+    image: ghcr.io/kosavina/mattermost-agent:${IMAGE_TAG:?set IMAGE_TAG in .env to a commit SHA}
+    restart: unless-stopped
+    environment:
+      MM_URL: ${MM_URL:?set MM_URL in .env}
+      MM_TOKEN_FILE: /run/secrets/mm_token
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    secrets: [mm_token]
+    # No ports: on purpose. The listener only makes outgoing connections.
+    read_only: true
+    tmpfs: [/tmp]
+    volumes:
+      - agent_data:/data        # handled posts and last-seen: keep this volume
+      # The long form, because the short one would create a folder if the file were missing.
+      - type: bind
+        source: ./rules.yaml
+        target: /config/rules.yaml
+        read_only: true
+        bind: {create_host_path: false}
+    user: "10001:10001"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Longer than the app's own 10-second limit, so Docker never has to force it.
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+secrets:
+  mm_token:
+    # Mounted as it is, keeping its permissions, and the app runs as another user. So the file
+    # must be mode 444, and its folder mode 700 to keep others out. MM_TOKEN_SOURCE lets the file
+    # live outside this folder.
+    file: ${MM_TOKEN_SOURCE:-./secrets/mm_token}
+
+volumes:
+  agent_data:
