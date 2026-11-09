@@ -108,7 +108,9 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 | `startup`, `connected` | It logged in, then opened the live connection |
 | `disconnected`, `reconnect_wait` | The connection dropped. It retries after `delay_s` seconds, at most 60 |
 | `catchup_start`, `catchup_done` | Fetching missed posts. `count` is channels at the start and posts at the end |
-| `catchup_truncated` | It could not fetch everything, because the outage passed 30 days or there were too many posts. Some older posts were left out |
+| `catchup_truncated` | It could not fetch everything, because the outage passed 30 days, there were too many posts, or a channel was skipped. Some posts were left out |
+| `channel_skipped` | The server refused one channel during catch-up, or sent something it could not read. `status` says which. It carries on with the others |
+| `lookup_failed` | It could not find out who a user is, so the post has no sender. It carries on |
 | `frame_skipped` | The server sent something it could not read. It carries on |
 | `shutdown`, `stopped` | A normal stop |
 | `internal_error` | A bug in a background task. Please report it |
@@ -122,6 +124,7 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 
 - **Missed posts.** Catch-up covers direct messages and channels named in your rules. A mention, or a post of your own, in any other channel while the listener is disconnected is not seen.
 - **Mentions found by catch-up.** Catch-up recognises only a literal `@yourname`. A post that reaches you through `@all`, `@here` or a mention keyword counts as a mention only when it arrives live.
+- **Posts without a sender.** After `lookup_failed` the post is logged with `sender=null`, and a rule with `from` cannot match it. It is not tried again.
 - **First run.** It starts from now and does not read old posts.
 - **Long outages.** Catch-up goes back at most 30 days.
 - **Rules** are read at startup, so a change needs a restart.

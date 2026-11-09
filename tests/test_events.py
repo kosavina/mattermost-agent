@@ -136,6 +136,11 @@ def test_channel_list() -> None:
     assert [channel.id for channel in parse_channel_list([row])] == ["c"]
 
 
+def test_channel_list_leaves_out_unknown_types() -> None:
+    rows = [{"id": "new", "name": "n", "type": "X"}, {"id": "c", "name": "n", "type": "D"}]
+    assert [channel.id for channel in parse_channel_list(rows)] == ["c"]
+
+
 @pytest.mark.parametrize("body", [{}, "text", [[]]])
 def test_malformed_channel_list_is_refused(body: object) -> None:
     with pytest.raises(MalformedEvent):

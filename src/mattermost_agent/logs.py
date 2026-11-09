@@ -26,6 +26,8 @@ type LifecycleEvent = Literal[
     "catchup_start",
     "catchup_done",
     "catchup_truncated",
+    "channel_skipped",
+    "lookup_failed",
     "frame_skipped",
     "shutdown",
     "stopped",
