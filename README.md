@@ -80,7 +80,7 @@ To stop it, run `docker compose down`. Your state stays in a Docker volume. To u
 
 ## Reading the logs
 
-Every line starts with the time, the level and `mattermost_agent`. A post looks like this:
+Every line starts with the time, the level and `mattermost_agent`. Values are padded with spaces so that columns line up; the examples here leave that out. A very long value pushes the rest of its own line to the right. A post looks like this:
 
 ```text
 event=post kind=mention channel="analytics" sender="example.user" length=42 rule="mentions-me" scenario="intake"

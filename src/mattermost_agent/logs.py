@@ -73,7 +73,8 @@ def log_post(
 ) -> None:
     """Write the one line for a post. `length` is the only thing logged about its text."""
     logger.info(
-        "event=%s kind=%s channel=%s sender=%s length=%d rule=%s scenario=%s",
+        # Padded so that columns line up. A longer value only shifts the rest of its own line.
+        "event=%-7s kind=%-12s channel=%-26s sender=%-20s length=%-5d rule=%-18s scenario=%s",
         event,
         kind,
         _quoted(channel),
@@ -95,7 +96,7 @@ def log_lifecycle(
 ) -> None:
     """Write a line about the app itself. Of `error`, only the class name is ever logged."""
     logger.info(
-        "event=%s reason=%s error=%s status=%s count=%s delay_s=%s",
+        "event=%-17s reason=%-14s error=%-20s status=%-4s count=%-6s delay_s=%s",
         event,
         reason or NO_VALUE,
         NO_VALUE if error is None else type(error).__name__,

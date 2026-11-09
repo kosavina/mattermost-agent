@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx2
 import pytest
-from helpers import captured_logs, posted_event, raw_post
+from helpers import captured_logs, posted_event, raw_post, squeezed
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 from mattermost_agent import __main__ as entry
@@ -163,7 +163,7 @@ class World:
 
     @property
     def log(self) -> str:
-        return self.stream.getvalue()
+        return squeezed(self.stream.getvalue())
 
     def lines(self, event: str) -> list[str]:
         return [line for line in self.log.splitlines() if f" event={event} " in line]
@@ -802,14 +802,14 @@ def test_main_logs_and_explains_a_failure_to_connect(
     with pytest.raises(SystemExit) as stopped:
         entry.main()
     assert stopped.value.code == "mattermost-agent: cannot reach the Mattermost server"
-    assert "event=fatal reason=unreachable" in launch.getvalue()
+    assert "event=fatal reason=unreachable" in squeezed(launch.getvalue())
 
 
 def test_main_logs_a_store_failure(launch: io.StringIO, monkeypatch: pytest.MonkeyPatch) -> None:
     stop_with(monkeypatch, StoreError("cannot use the database"))
     with pytest.raises(SystemExit):
         entry.main()
-    assert "event=fatal reason=store_error" in launch.getvalue()
+    assert "event=fatal reason=store_error" in squeezed(launch.getvalue())
 
 
 def test_main_shows_only_the_class_of_an_unexpected_error(
@@ -820,7 +820,7 @@ def test_main_shows_only_the_class_of_an_unexpected_error(
         entry.main()
     assert stopped.value.code == "mattermost-agent: stopped by ValueError"
     assert stopped.value.__suppress_context__
-    assert "event=fatal reason=null error=ValueError" in launch.getvalue()
+    assert "event=fatal reason=null error=ValueError" in squeezed(launch.getvalue())
     captured = capsys.readouterr()
     assert SECRET_TEXT not in launch.getvalue() + captured.out + captured.err
 
