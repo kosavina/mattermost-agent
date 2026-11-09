@@ -70,6 +70,9 @@ class World:
         self.scripts: list[Script] = []
         self.requests: list[httpx2.Request] = []
         self.channel_list_status = 200
+        self.channel_statuses: dict[str, int] = {}
+        # Answers for one user, used in turn. The last one is repeated.
+        self.user_statuses: dict[str, list[int]] = {}
         self.block_posts = False
         self.me_status = 200
         self.sleeps: list[float] = []
@@ -89,12 +92,18 @@ class World:
             return httpx2.Response(self.channel_list_status, json=self.channels)
         if path.startswith("/users/"):
             user_id = path.rsplit("/", 1)[1]
+            statuses = self.user_statuses.get(user_id, [200])
+            status = statuses.pop(0) if len(statuses) > 1 else statuses[0]
+            if status != 200:
+                return httpx2.Response(status, json={})
             if user_id not in self.users:
                 return httpx2.Response(404, json={})
             return httpx2.Response(200, json={"id": user_id, "username": self.users[user_id]})
         if self.block_posts:
             await asyncio.Event().wait()
         channel_id = path.split("/")[2]
+        if channel_id in self.channel_statuses:
+            return httpx2.Response(self.channel_statuses[channel_id], json={})
         posts = sorted(self.posts.get(channel_id, []), key=lambda p: p["create_at"], reverse=True)
         page, size = int(request.url.params["page"]), int(request.url.params["per_page"])
         chosen = posts[page * size : (page + 1) * size]
@@ -494,6 +503,120 @@ def test_a_failed_catch_up_is_retried_and_moves_nothing(world: World) -> None:
     world.go(scenario)
     assert "reason=server_error" in world.lines("disconnected")[0]
     assert "status=500" in world.lines("disconnected")[0]
+
+
+def test_a_live_post_survives_a_passing_lookup_failure(world: World) -> None:
+    world.user_statuses = {"other-id": [500, 200]}
+    world.scripts = [Script([frame("a")])]
+    world.go(lambda: until(lambda: world.handled("a")))
+    assert 'sender="example.user"' in world.lines("post")[0]
+    assert world.sleeps == [1.0]
+    assert world.lines("disconnected") == []
+
+
+def test_a_lookup_that_keeps_failing_loses_no_live_post(world: World) -> None:
+    world.user_statuses = {"other-id": [500]}
+    world.scripts = [
+        Script(
+            [
+                frame("a", channel_type="O", channel_name="random"),
+                frame("b", LATER + 1, channel_type="O", channel_name="random"),
+            ]
+        )
+    ]
+    world.go(lambda: until(lambda: world.handled("b")))
+    assert world.handled("a")
+    assert [line.count("sender=null") for line in world.lines("post")] == [1, 1]
+    assert "status=500" in world.lines("lookup_failed")[0]
+    assert world.lines("disconnected") == []
+    assert world.store.last_seen() == LATER + 1
+
+
+def test_a_hidden_sender_does_not_stop_catch_up_or_live_posts(world: World) -> None:
+    world.store.set_first_last_seen(NOW_MS)
+    world.user_statuses = {"hidden-id": [403]}
+    world.channels = [channel("dm", last_post_at=NOW_MS + 5)]
+    world.posts = {
+        "dm": [raw_post(id="old", channel_id="dm", user_id="hidden-id", create_at=NOW_MS + 5)]
+    }
+    world.scripts = [Script([frame("live")])]
+    world.go(lambda: until(lambda: world.handled("live")))
+    assert world.handled("old")
+    assert "status=403" in world.lines("lookup_failed")[0]
+    # Trying again could not help, so nothing waited.
+    assert world.sleeps == []
+    assert world.lines("disconnected") == []
+
+
+def test_a_passing_lookup_failure_repeats_the_catch_up_and_keeps_the_sender(world: World) -> None:
+    world.store.set_first_last_seen(NOW_MS)
+    world.user_statuses = {"other-id": [500, 500, 500, 200]}
+    world.channels = [channel("dm", last_post_at=NOW_MS + 5)]
+    world.posts = {"dm": [raw_post(id="a", channel_id="dm", create_at=NOW_MS + 5)]}
+    world.go(lambda: until(lambda: world.handled("a")))
+    assert 'sender="example.user"' in world.lines("post")[0]
+    assert world.sleeps == [1.0, 2.0, 1.0]
+    assert world.lines("lookup_failed") == []
+    assert "status=500" in world.lines("disconnected")[0]
+
+
+def test_a_refused_channel_is_skipped_and_the_rest_are_read(world: World) -> None:
+    world.store.set_first_last_seen(NOW_MS)
+    world.channel_statuses = {"refused": 403}
+    world.channels = [
+        channel("refused", last_post_at=NOW_MS + 5),
+        channel("dm", last_post_at=NOW_MS + 5),
+    ]
+    world.posts = {"dm": [raw_post(id="a", channel_id="dm", create_at=NOW_MS + 5)]}
+    world.scripts = [Script([frame("live")])]
+    world.go(lambda: until(lambda: world.handled("live")))
+    assert world.handled("a")
+    assert "status=403" in world.lines("channel_skipped")[0]
+    assert len(world.lines("catchup_truncated")) == 1
+    assert world.lines("disconnected") == []
+
+
+def test_a_passing_channel_failure_repeats_the_catch_up(world: World) -> None:
+    world.store.set_first_last_seen(NOW_MS)
+    world.channel_statuses = {"dm": 503}
+    world.channels = [channel("dm", last_post_at=NOW_MS + 5)]
+    world.posts = {"dm": [raw_post(id="a", channel_id="dm", create_at=NOW_MS + 5)]}
+
+    async def scenario() -> None:
+        await until(lambda: len(world.lines("disconnected")) >= 1)
+        world.channel_statuses = {}
+        await until(lambda: world.handled("a"))
+
+    world.go(scenario)
+    assert world.lines("channel_skipped") == []
+    assert world.lines("catchup_truncated") == []
+
+
+def test_a_channel_of_an_unknown_type_does_not_stop_catch_up(world: World) -> None:
+    world.store.set_first_last_seen(NOW_MS)
+    world.channels = [
+        channel("new-kind", kind="X", last_post_at=NOW_MS + 5),
+        channel("dm", last_post_at=NOW_MS + 5),
+    ]
+    world.posts = {"dm": [raw_post(id="a", channel_id="dm", create_at=NOW_MS + 5)]}
+    world.go(lambda: until(lambda: world.handled("a")))
+    assert set(world.post_paths()) == {"/api/v4/channels/dm/posts"}
+    assert world.lines("disconnected") == []
+
+
+def test_a_token_revoked_during_a_lookup_stops_the_app(world: World) -> None:
+    world.user_statuses = {"other-id": [401]}
+    world.scripts = [Script([frame("a")])]
+
+    async def main() -> None:
+        async with serve(world.websocket, "127.0.0.1", 0) as server:
+            with pytest.raises(MattermostError) as error:
+                await app.run(world.runtime(address_of(server)))
+            assert error.value.status == 401
+        await world.client.aclose()
+
+    asyncio.run(main())
+    assert not world.handled("a")
 
 
 def test_failures_back_off_and_success_resets_the_delay(world: World) -> None:

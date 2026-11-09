@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 
 from websockets.asyncio.client import ClientConnection
@@ -39,6 +40,8 @@ from mattermost_agent.store import RETENTION_MS, Store, StoreError
 OVERLAP_MS = 5 * 60 * 1000
 MAX_BACKOFF_SECONDS = 60
 MAX_BACKOFF_DOUBLINGS = 6
+# A call that may work a moment later is tried again after each of these waits.
+RETRY_DELAYS_SECONDS = (1.0, 2.0)
 HEARTBEAT_FILE = "heartbeat"
 HEARTBEAT_SECONDS = 15.0
 HEARTBEAT_MAX_AGE_SECONDS = 45.0
@@ -80,7 +83,49 @@ def backoff_delay(failures: int, jitter: float) -> float:
     return ceiling * (0.5 + jitter / 2)
 
 
-async def _logged_channel(runtime: Runtime, me: Me, post: Post) -> str | None:
+def _is_passing(error: MattermostError) -> bool:
+    """Say whether the same call could work a moment later."""
+    return (
+        error.reason == "unreachable"
+        or error.status == HTTPStatus.TOO_MANY_REQUESTS
+        or (error.status is not None and error.status >= HTTPStatus.INTERNAL_SERVER_ERROR)
+    )
+
+
+async def _with_retries[**P, T](
+    runtime: Runtime,
+    call: Callable[P, Awaitable[T]],
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> T:
+    for delay in RETRY_DELAYS_SECONDS:
+        try:
+            return await call(*args, **kwargs)
+        except MattermostError as error:
+            if not _is_passing(error):
+                raise
+        await runtime.sleep(delay)
+    return await call(*args, **kwargs)
+
+
+async def _username(runtime: Runtime, user_id: str, *, live: bool) -> str | None:
+    """Return a username, or None if the lookup fails in a way that must not stop the listener.
+
+    After a passing failure, catch-up raises: it runs again later, loses nothing and keeps the
+    sender for `from` rules. A live post is not sent twice, so it goes on without a sender.
+    """
+    try:
+        return await _with_retries(runtime, runtime.client.username, user_id)
+    except MattermostError as error:
+        if error.reason == "auth_rejected" or (_is_passing(error) and not live):
+            raise
+        log_lifecycle(
+            "lookup_failed", reason=error.reason, status=error.status, error=error.__cause__
+        )
+        return None
+
+
+async def _logged_channel(runtime: Runtime, me: Me, post: Post, *, live: bool) -> str | None:
     """Return the name to log: the channel's, or for a DM I sent, who it went to.
 
     A DM's own name is only two user ids, and on a DM sent to me the sender says more.
@@ -90,7 +135,7 @@ async def _logged_channel(runtime: Runtime, me: Me, post: Post) -> str | None:
     if post.channel_type != "D" or not is_own(post, me):
         return None
     partner = dm_partner(post.channel_name, me.user_id)
-    username = None if partner is None else await runtime.client.username(partner)
+    username = None if partner is None else await _username(runtime, partner, live=live)
     return None if username is None else f"@{username}"
 
 
@@ -98,8 +143,8 @@ async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> N
     if is_ignored(post):
         return
     kind = classify(post, me)
-    sender = await runtime.client.username(post.user_id)
-    channel = await _logged_channel(runtime, me, post)
+    sender = await _username(runtime, post.user_id, live=live)
+    channel = await _logged_channel(runtime, me, post, live=live)
     rule = first_match(runtime.rules, post, kind, sender, own=is_own(post, me))
     claim = runtime.store.claim(
         post.id,
@@ -143,7 +188,15 @@ async def _catch_up(runtime: Runtime, me: Me) -> None:
 
     posts: list[Post] = []
     for channel in to_read:
-        result = await runtime.client.posts_since(channel, floor)
+        try:
+            result = await _with_retries(runtime, runtime.client.posts_since, channel, floor)
+        except MattermostError as error:
+            if error.reason == "auth_rejected" or _is_passing(error):
+                raise
+            # Only this channel is affected, and repeating the catch-up would not change that.
+            log_lifecycle("channel_skipped", reason=error.reason, status=error.status)
+            truncated = True
+            continue
         posts += result.posts
         truncated = truncated or result.truncated
     if truncated:

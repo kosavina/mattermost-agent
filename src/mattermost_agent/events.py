@@ -22,6 +22,10 @@ class MalformedEvent(Exception):
     """The server sent something unexpected. The message names the field only."""
 
 
+class UnknownChannelType(MalformedEvent):
+    """A channel of a type this code does not know, perhaps from a newer server."""
+
+
 @dataclass(frozen=True)
 class Me:
     """The account the listener runs as."""
@@ -112,7 +116,7 @@ def dm_partner(channel_name: str, my_id: str) -> str | None:
 def _channel_type(container: dict[str, object], key: str) -> str:
     value = _text(container, key)
     if value not in CHANNEL_TYPES:
-        raise MalformedEvent(f"{key} is not a known channel type")
+        raise UnknownChannelType(f"{key} is not a known channel type")
     return value
 
 
@@ -171,10 +175,16 @@ def parse_channel(raw: object) -> Channel:
 
 
 def parse_channel_list(body: object) -> list[Channel]:
-    """Return the whole channel listing."""
+    """Return the channel listing, leaving out channels of a type this code does not know."""
     if not isinstance(body, list):
         raise MalformedEvent("channel list is not a list")
-    return [parse_channel(row) for row in body]
+    channels: list[Channel] = []
+    for row in body:
+        try:
+            channels.append(parse_channel(row))
+        except UnknownChannelType:
+            continue
+    return channels
 
 
 def parse_user(body: object) -> Me:
