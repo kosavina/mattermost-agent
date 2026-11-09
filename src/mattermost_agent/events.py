@@ -98,6 +98,17 @@ def _number(container: dict[str, object], key: str, default: int | None = None) 
     return value
 
 
+def dm_partner(channel_name: str, my_id: str) -> str | None:
+    """Return the other user's id from a DM's name, `id__id`, or None if the name is unusual.
+
+    In a DM to myself, both ids are mine.
+    """
+    ids = channel_name.split("__")
+    if len(ids) != 2 or not all(ids) or my_id not in ids:
+        return None
+    return ids[1] if ids[0] == my_id else ids[0]
+
+
 def _channel_type(container: dict[str, object], key: str) -> str:
     value = _text(container, key)
     if value not in CHANNEL_TYPES:

@@ -80,21 +80,27 @@ def test_not_a_text_mention(message: str) -> None:
     assert classify(make_post(message=message, mentions=None), ME) == "channel"
 
 
-def test_own_post_is_ignored() -> None:
-    assert is_ignored(make_post(user_id=ME.user_id), ME)
+def test_own_post_is_kept() -> None:
+    assert not is_ignored(make_post(user_id=ME.user_id))
+
+
+@pytest.mark.parametrize("mentions", [None, frozenset({ME.user_id})])
+def test_my_own_name_in_my_post_is_not_a_mention(mentions: frozenset[str] | None) -> None:
+    post = make_post(user_id=ME.user_id, message="@example.me note", mentions=mentions)
+    assert classify(post, ME) == "channel"
 
 
 def test_system_post_is_ignored() -> None:
-    assert is_ignored(make_post(post_type="system_join_channel"), ME)
+    assert is_ignored(make_post(post_type="system_join_channel"))
 
 
 def test_deleted_post_is_ignored() -> None:
-    assert is_ignored(make_post(deleted=True), ME)
+    assert is_ignored(make_post(deleted=True))
 
 
 def test_ordinary_post_is_kept() -> None:
-    assert not is_ignored(make_post(), ME)
+    assert not is_ignored(make_post())
 
 
 def test_other_post_types_are_kept() -> None:
-    assert not is_ignored(make_post(post_type="slack_attachment"), ME)
+    assert not is_ignored(make_post(post_type="slack_attachment"))

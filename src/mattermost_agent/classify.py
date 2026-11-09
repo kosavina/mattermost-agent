@@ -9,9 +9,13 @@ type Kind = Literal["dm", "group_dm", "mention", "thread_reply", "channel"]
 KINDS: frozenset[str] = frozenset(get_args(Kind.__value__))
 
 
-def is_ignored(post: Post, me: Me) -> bool:
-    """Skip my own posts, posts already deleted, and "X joined the channel" notices."""
-    return post.user_id == me.user_id or post.deleted or post.post_type.startswith("system_")
+def is_own(post: Post, me: Me) -> bool:
+    return post.user_id == me.user_id
+
+
+def is_ignored(post: Post) -> bool:
+    """Skip posts already deleted, and "X joined the channel" notices."""
+    return post.deleted or post.post_type.startswith("system_")
 
 
 def _text_mentions(message: str, username: str) -> bool:
@@ -31,12 +35,15 @@ def _mentions_me(post: Post, me: Me) -> bool:
 
 
 def classify(post: Post, me: Me) -> Kind:
-    """Return the post's kind. A DM stays a DM, and a reply that mentions me is a mention."""
+    """Return the post's kind. A DM stays a DM, and a reply that mentions me is a mention.
+
+    Writing my own @name in a post of mine is not a mention.
+    """
     if post.channel_type == "D":
         return "dm"
     if post.channel_type == "G":
         return "group_dm"
-    if _mentions_me(post, me):
+    if not is_own(post, me) and _mentions_me(post, me):
         return "mention"
     if post.root_id:
         return "thread_reply"

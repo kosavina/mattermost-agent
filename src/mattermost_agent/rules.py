@@ -160,8 +160,11 @@ def load_rules(path: Path) -> RuleSet:
         raise RulesError(f"the rules file {path}: {error}") from None
 
 
-def _matches(rule: Rule, post: Post, kind: Kind, sender: str | None) -> bool:
+def _matches(rule: Rule, post: Post, kind: Kind, sender: str | None, *, own: bool) -> bool:
     """Every condition the rule sets must hold. Within a list, any one item is enough."""
+    # A post of mine needs a rule that names me, or `kind: dm` would also match the DMs I send.
+    if own and not rule.senders:
+        return False
     if rule.kind is not None and rule.kind != kind:
         return False
     if rule.channels and post.channel_name.casefold() not in rule.channels:
@@ -175,6 +178,10 @@ def _matches(rule: Rule, post: Post, kind: Kind, sender: str | None) -> bool:
     return True
 
 
-def first_match(rule_set: RuleSet, post: Post, kind: Kind, sender: str | None) -> Rule | None:
+def first_match(
+    rule_set: RuleSet, post: Post, kind: Kind, sender: str | None, *, own: bool
+) -> Rule | None:
     """Return the first rule that matches, in file order, or None."""
-    return next((rule for rule in rule_set.rules if _matches(rule, post, kind, sender)), None)
+    return next(
+        (rule for rule in rule_set.rules if _matches(rule, post, kind, sender, own=own)), None
+    )

@@ -251,11 +251,71 @@ def test_a_mention_is_recognised(world: World) -> None:
     assert 'rule="mentions-me"' in world.lines("post")[0]
 
 
-def test_my_own_post_is_skipped(world: World) -> None:
-    world.scripts = [Script([frame("mine", user_id="me-id"), frame("theirs", LATER + 1)])]
-    world.go(lambda: until(lambda: world.handled("theirs")))
-    assert not world.handled("mine")
-    assert len(world.lines("post")) == 1
+def test_my_own_dm_is_logged_with_who_it_went_to(world: World) -> None:
+    world.scripts = [Script([frame("mine", user_id="me-id", message=SECRET_TEXT)])]
+    world.go(lambda: until(lambda: world.handled("mine")))
+    line = world.lines("post")[0]
+    assert f'kind=dm channel="@example.user" sender="example.me" length={len(SECRET_TEXT)}' in line
+    assert "rule=null scenario=null" in line
+    assert SECRET_TEXT not in world.log
+
+
+def test_my_own_channel_post_logs_the_channel(world: World) -> None:
+    world.scripts = [Script([frame("a", user_id="me-id", channel_type="O", channel_name="dev")])]
+    world.go(lambda: until(lambda: world.handled("a")))
+    assert 'kind=channel channel="dev" sender="example.me"' in world.lines("post")[0]
+
+
+@pytest.mark.parametrize(
+    ("channel_type", "channel_name", "logged"),
+    [
+        ("D", "me-id__me-id", '"@example.me"'),
+        ("D", "me-id__nobody", "null"),
+        ("D", "unusual", "null"),
+        ("G", "abc123", "null"),
+    ],
+)
+def test_where_my_own_private_message_went(
+    world: World, channel_type: str, channel_name: str, logged: str
+) -> None:
+    post = frame("a", user_id="me-id", channel_type=channel_type, channel_name=channel_name)
+    world.scripts = [Script([post])]
+    world.go(lambda: until(lambda: world.handled("a")))
+    assert f"channel={logged} " in world.lines("post")[0]
+
+
+def test_my_own_post_matches_only_a_rule_that_names_me(world: World) -> None:
+    world.rules_text = """
+rules:
+  - {name: from-others, kind: dm, scenario: one}
+  - {name: from-me, kind: dm, from: [example.me], scenario: two}
+limits: {matches_per_hour: 5}
+"""
+    world.scripts = [Script([frame("a", user_id="me-id")])]
+    world.go(lambda: until(lambda: world.handled("a")))
+    assert 'rule="from-me" scenario="two"' in world.lines("post")[0]
+
+
+def test_my_own_post_sent_twice_is_logged_once(world: World) -> None:
+    mine = frame("a", user_id="me-id")
+    world.scripts = [Script([mine, mine, frame("b", LATER + 1)])]
+    world.go(lambda: until(lambda: world.handled("b")))
+    assert len(world.lines("post")) == 2
+
+
+def test_my_own_post_is_found_by_catch_up(world: World) -> None:
+    direct = channel("dm-1", name="me-id__other-id")
+    world.channels = [direct]
+    mine = raw_post(id="mine", channel_id="dm-1", user_id="me-id", create_at=LATER + 20)
+
+    async def lose_connection() -> None:
+        await until(lambda: world.handled("first"))
+        world.posts["dm-1"] = [mine]
+        direct["last_post_at"] = mine["create_at"]
+
+    world.scripts = [Script([frame("first", LATER + 10)], after=lose_connection, close=True)]
+    world.go(lambda: until(lambda: world.handled("mine")))
+    assert 'channel="@example.user" sender="example.me"' in world.lines("post")[1]
 
 
 def test_a_system_post_is_skipped(world: World) -> None:
