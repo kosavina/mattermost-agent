@@ -3,6 +3,7 @@
 import io
 import json
 import logging
+import re
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
@@ -27,6 +28,11 @@ def captured_logs(level: str = "INFO") -> Generator[io.StringIO]:
             logger.handlers[:] = handlers
             logger.setLevel(logger_level)
             logger.propagate = propagate
+
+
+def squeezed(log: str) -> str:
+    """Remove the padding between log columns, so that tests can compare the values."""
+    return re.sub(" +", " ", log)
 
 
 def raw_post(**fields: Any) -> dict[str, Any]:

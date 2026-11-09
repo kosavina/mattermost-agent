@@ -5,6 +5,7 @@ import re
 from collections.abc import Generator
 
 import pytest
+from helpers import squeezed
 
 from mattermost_agent import logs
 
@@ -39,20 +40,48 @@ def test_post_line_has_exactly_the_allowed_fields(output: io.StringIO) -> None:
     assert re.fullmatch(
         TIMESTAMP + r" INFO mattermost_agent event=post kind=mention channel="
         r'"analytics" sender="example\.user" length=42 rule="mentions-me" scenario="intake"\n',
-        output.getvalue(),
+        squeezed(output.getvalue()),
     )
+
+
+def test_post_columns_line_up(output: io.StringIO) -> None:
+    for channel, sender in (("a", "b"), ("a-longer-channel", "a.longer.user")):
+        logs.log_post(
+            "post", kind="dm", channel=channel, sender=sender, length=1, rule=None, scenario=None
+        )
+    first, second = output.getvalue().splitlines()
+    for column in ("kind=", "channel=", "sender=", "length=", "rule=", "scenario="):
+        assert first.index(column) == second.index(column)
+
+
+def test_lifecycle_columns_line_up(output: io.StringIO) -> None:
+    logs.log_lifecycle("startup")
+    logs.log_lifecycle("catchup_truncated", reason="unreachable", status=503, count=20)
+    first, second = output.getvalue().splitlines()
+    for column in ("reason=", "error=", "status=", "count=", "delay_s="):
+        assert first.index(column) == second.index(column)
+
+
+def test_a_value_wider_than_its_column_is_kept_whole(output: io.StringIO) -> None:
+    channel = "x" * 64
+    logs.log_post(
+        "post", kind="dm", channel=channel, sender=None, length=1, rule=None, scenario=None
+    )
+    assert f'channel="{channel}" sender=' in output.getvalue()
 
 
 def test_post_without_a_rule_shows_null(output: io.StringIO) -> None:
     logs.log_post("post", kind="dm", channel=None, sender=None, length=0, rule=None, scenario=None)
-    assert "channel=null sender=null length=0 rule=null scenario=null\n" in output.getvalue()
+    assert "channel=null sender=null length=0 rule=null scenario=null\n" in squeezed(
+        output.getvalue()
+    )
 
 
 def test_text_null_stays_distinct_from_no_value(output: io.StringIO) -> None:
     logs.log_post(
         "post", kind="dm", channel="null", sender=None, length=0, rule=None, scenario=None
     )
-    assert 'channel="null" sender=null' in output.getvalue()
+    assert 'channel="null" sender=null' in squeezed(output.getvalue())
 
 
 def test_text_cannot_add_a_log_line(output: io.StringIO) -> None:
@@ -95,14 +124,14 @@ def test_lifecycle_line(output: io.StringIO) -> None:
     logs.log_lifecycle("reconnect_wait", reason="unreachable", status=503, count=2, delay_seconds=4)
     assert (
         "event=reconnect_wait reason=unreachable error=null status=503 count=2 delay_s=4.0\n"
-        in (output.getvalue())
+        in squeezed(output.getvalue())
     )
 
 
 def test_lifecycle_without_details_shows_null(output: io.StringIO) -> None:
     logs.log_lifecycle("startup")
     assert "event=startup reason=null error=null status=null count=null delay_s=null\n" in (
-        output.getvalue()
+        squeezed(output.getvalue())
     )
 
 
