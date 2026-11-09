@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.15.2"
+      - run: uv sync --locked
+      - run: uv run ruff format --check .
+      - run: uv run ruff check --output-format=github .
+      # Warnings fail this step through error-on-warning in pyproject.toml.
+      - run: uv run ty check
+      - run: uv run pytest
+
+  image:
+    name: image
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write   # used only by the push step, which runs on main only
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      PLATFORMS: linux/amd64,linux/arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # QEMU lets this amd64 machine run the arm64 build steps; Buildx builds both at once.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build amd64 for the smoke test
+        run: docker buildx build --pull --platform linux/amd64 --load --tag "$IMAGE:smoke" .
+      # No network and a fake token, so nothing here can reach a real server.
+      - name: Smoke test
+        run: |
+          token=ci-sentinel-not-a-real-token-0123456789
+          secrets_dir="$RUNNER_TEMP/secrets"
+          install -d -m 700 "$secrets_dir"
+          printf '%s' "$token" > "$secrets_dir/mm_token"
+          chmod 444 "$secrets_dir/mm_token"
+          hardened=(--rm --network none --read-only --tmpfs /tmp
+            --tmpfs "/data:uid=10001,mode=700" --cap-drop ALL
+            --security-opt no-new-privileges:true)
+
+          # Runs as uid 10001, and can write only to /data and /tmp.
+          docker run "${hardened[@]}" "$IMAGE:smoke" sh -ec '
+            test "$(id -u)" = 10001
+            touch /data/allowed /tmp/allowed
+            for path in /nope /app/nope /etc/nope /usr/local/bin/nope; do
+              if touch "$path" 2>/dev/null; then echo "could write $path"; exit 1; fi
+            done'
+
+          # Reaching the users/me call proves the image read the mode 444 token as uid 10001,
+          # parsed the shipped example rules, and opened its database. Without a network, that
+          # call must fail cleanly. DEBUG is the level most likely to print something it should not.
+          status=0
+          output=$(docker run "${hardened[@]}" \
+            --env MM_URL=https://mattermost.invalid \
+            --env MM_TOKEN_FILE=/run/secrets/mm_token \
+            --env LOG_LEVEL=DEBUG \
+            --volume "$secrets_dir/mm_token:/run/secrets/mm_token:ro" \
+            --volume "$PWD/rules.example.yaml:/config/rules.yaml:ro" \
+            "$IMAGE:smoke" 2>&1) || status=$?
+          echo "$output"
+          test "$status" = 1
+          grep -q 'reason=unreachable' <<< "$output"
+          if grep -qF "$token" <<< "$output"; then echo "the token reached the logs"; exit 1; fi
+      - name: Build amd64 and arm64
+        run: docker buildx build --pull --platform "$PLATFORMS" --output type=cacheonly .
+      # Uses the layers built above, so this publishes what was just built.
+      - name: Push to GHCR (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx build --platform "$PLATFORMS" --push \
+            --label org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --tag "$IMAGE:$GITHUB_SHA" .
+          docker logout ghcr.io
