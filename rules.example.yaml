@@ -5,7 +5,7 @@
 #
 #   kind      dm, group_dm, mention, thread_reply or channel
 #   channels  the name in the channel's URL (town-square), not its title (Town Square)
-#   from      usernames, without the @
+#   from      usernames, without the @. Your own posts match only a rule that lists you here
 #   keywords  case-insensitive; part of a word counts, so "metric" also finds "metrics"
 #   scenario  a label for later milestones; it is only logged for now
 #

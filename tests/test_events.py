@@ -8,6 +8,7 @@ from mattermost_agent.events import (
     Channel,
     MalformedEvent,
     Me,
+    dm_partner,
     is_hello,
     parse_channel,
     parse_channel_list,
@@ -191,3 +192,20 @@ def test_deleted_rest_post_is_marked() -> None:
 def test_malformed_rest_page_is_refused(body: object) -> None:
     with pytest.raises(MalformedEvent):
         parse_post_page(body, CHANNEL)
+
+
+@pytest.mark.parametrize(
+    ("name", "partner"),
+    [
+        ("me__other", "other"),
+        ("other__me", "other"),
+        ("me__me", "me"),
+        ("", None),
+        ("me", None),
+        ("me__", None),
+        ("a__b", None),
+        ("me__a__b", None),
+    ],
+)
+def test_dm_partner(name: str, partner: str | None) -> None:
+    assert dm_partner(name, "me") == partner

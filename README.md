@@ -9,6 +9,7 @@ This is a dry run, the first milestone of a personal agent.
 - Follows new posts live over a WebSocket, and reconnects by itself if the connection drops.
 - After each reconnect, fetches the posts it missed in your direct messages and in the channels your rules name.
 - Sorts each post as `dm`, `group_dm`, `mention`, `thread_reply` or `channel`, then applies the first rule that matches.
+- Includes the posts you send. A rule applies to those only if its `from` list names you.
 - Logs one line per post, without the message text.
 
 **What it does not do**
@@ -89,12 +90,12 @@ event=post kind=mention channel="analytics" sender="example.user" length=42 rule
 | --- | --- |
 | `event` | `post`, or `cap_hit` if the post matched a rule but the hourly limit was already reached |
 | `kind` | `dm`, `group_dm`, `mention`, `thread_reply` or `channel` |
-| `channel` | The channel's URL name, or `null` for direct and group messages |
+| `channel` | The channel's URL name. For a direct message you sent, `@` and the recipient's username. Otherwise `null` for direct and group messages |
 | `sender` | The sender's username, or `null` if it could not be looked up |
 | `length` | Number of characters in the post. This is the only thing logged about its text |
 | `rule`, `scenario` | The rule that matched and its label, or `null` if none did |
 
-Your own posts, duplicates, deleted posts and system messages ("X joined the channel") are skipped and not logged.
+Duplicates, deleted posts and system messages ("X joined the channel") are skipped and not logged.
 
 Lines about the listener itself have this shape:
 
@@ -119,7 +120,7 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 
 ## Known limits
 
-- **Missed mentions.** Catch-up covers direct messages and channels named in your rules. A mention in any other channel while the listener is disconnected is not seen.
+- **Missed posts.** Catch-up covers direct messages and channels named in your rules. A mention, or a post of your own, in any other channel while the listener is disconnected is not seen.
 - **Mentions found by catch-up.** Catch-up recognises only a literal `@yourname`. A post that reaches you through `@all`, `@here` or a mention keyword counts as a mention only when it arrives live.
 - **First run.** It starts from now and does not read old posts.
 - **Long outages.** Catch-up goes back at most 30 days.

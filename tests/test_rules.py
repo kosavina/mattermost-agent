@@ -34,10 +34,25 @@ def matched(
     rule_set: RuleSet,
     kind: Kind = "channel",
     sender: str | None = "example.user",
+    own: bool = False,
     **post: object,
 ) -> str | None:
-    rule = first_match(rule_set, make_post(**post), kind, sender)
+    rule = first_match(rule_set, make_post(**post), kind, sender, own=own)
     return None if rule is None else rule.name
+
+
+def test_my_own_post_skips_a_rule_that_names_no_sender() -> None:
+    assert matched(rules_of("name: r, kind: dm, scenario: a"), "dm", "example.me", own=True) is None
+
+
+def test_my_own_post_matches_a_rule_that_names_me() -> None:
+    rule_set = rules_of("name: r, kind: dm, from: [example.me], scenario: a")
+    assert matched(rule_set, "dm", "example.me", own=True) == "r"
+
+
+def test_my_own_post_skips_a_rule_that_names_someone_else() -> None:
+    rule_set = rules_of("name: r, kind: dm, from: [example.user], scenario: a")
+    assert matched(rule_set, "dm", "example.me", own=True) is None
 
 
 def test_the_documented_example_is_valid() -> None:

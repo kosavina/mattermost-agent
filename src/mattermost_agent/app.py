@@ -20,8 +20,15 @@ from pathlib import Path
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
-from mattermost_agent.classify import classify, is_ignored
-from mattermost_agent.events import Channel, MalformedEvent, Me, Post, parse_websocket_message
+from mattermost_agent.classify import classify, is_ignored, is_own
+from mattermost_agent.events import (
+    Channel,
+    MalformedEvent,
+    Me,
+    Post,
+    dm_partner,
+    parse_websocket_message,
+)
 from mattermost_agent.logs import log_lifecycle, log_post
 from mattermost_agent.mattermost import MattermostClient, MattermostError
 from mattermost_agent.rules import RuleSet, first_match
@@ -73,17 +80,27 @@ def backoff_delay(failures: int, jitter: float) -> float:
     return ceiling * (0.5 + jitter / 2)
 
 
-def _logged_channel(post: Post) -> str | None:
-    """Return the name to log. A DM's name is only two user ids, and the sender says more."""
-    return post.channel_name if post.channel_type in {"O", "P"} else None
+async def _logged_channel(runtime: Runtime, me: Me, post: Post) -> str | None:
+    """Return the name to log: the channel's, or for a DM I sent, who it went to.
+
+    A DM's own name is only two user ids, and on a DM sent to me the sender says more.
+    """
+    if post.channel_type in {"O", "P"}:
+        return post.channel_name
+    if post.channel_type != "D" or not is_own(post, me):
+        return None
+    partner = dm_partner(post.channel_name, me.user_id)
+    username = None if partner is None else await runtime.client.username(partner)
+    return None if username is None else f"@{username}"
 
 
 async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> None:
-    if is_ignored(post, me):
+    if is_ignored(post):
         return
     kind = classify(post, me)
     sender = await runtime.client.username(post.user_id)
-    rule = first_match(runtime.rules, post, kind, sender)
+    channel = await _logged_channel(runtime, me, post)
+    rule = first_match(runtime.rules, post, kind, sender, own=is_own(post, me))
     claim = runtime.store.claim(
         post.id,
         post.create_at,
@@ -97,7 +114,7 @@ async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> N
     log_post(
         "cap_hit" if claim == "cap_hit" else "post",
         kind=kind,
-        channel=_logged_channel(post),
+        channel=channel,
         sender=sender,
         length=len(post.message),
         rule=None if rule is None else rule.name,
