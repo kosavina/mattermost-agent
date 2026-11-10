@@ -137,6 +137,14 @@ def test_control_characters_cannot_reach_the_terminal(store: Store, run: Run) ->
     assert "title\\x1b]0;evil\\x07 tab\there\\x0d\nnext \\x85\n" in out
 
 
+def test_a_post_time_out_of_range_is_shown_as_a_number(store: Store, run: Run) -> None:
+    post = make_post(id="a", create_at=10**17, message="far future")
+    store.claim(post, kind="dm", rule=RULE, place=None, live=True, now=NOW, cap=20, bursts=BURSTS)
+    code, out = run("jobs", "1")
+    assert code == 0
+    assert f"--- {10**14} kind=dm\nfar future\n" in out
+
+
 def test_safe_text_keeps_ordinary_text() -> None:
     text = "Привет, @example.user!\n\tsee https://example.com/x?y=1"
     assert jobs.safe_text(text) == text

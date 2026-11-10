@@ -30,8 +30,11 @@ def safe_text(text: str) -> str:
 
 
 def _when(seconds: float) -> str:
-    """Return a time of this machine, in its local time zone."""
-    return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M:%S")
+    """Return a time in this machine's local time zone, or the raw number if it is out of range."""
+    try:
+        return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M:%S")
+    except OverflowError, OSError, ValueError:
+        return f"{seconds:.0f}"
 
 
 def _line(job: Job) -> str:
