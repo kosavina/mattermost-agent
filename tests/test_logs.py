@@ -54,6 +54,46 @@ def test_post_columns_line_up(output: io.StringIO) -> None:
         assert first.index(column) == second.index(column)
 
 
+def test_job_line_has_exactly_the_allowed_fields(output: io.StringIO) -> None:
+    logs.log_job(
+        "job_opened",
+        job_id=3,
+        status="collecting",
+        scenario="intake",
+        rule="dm-from-anyone",
+        place="@example.user",
+        post_count=1,
+    )
+    assert re.fullmatch(
+        TIMESTAMP + r" INFO mattermost_agent event=job_opened job=3 status=collecting "
+        r'scenario="intake" rule="dm-from-anyone" place="@example\.user" posts=1\n',
+        squeezed(output.getvalue()),
+    )
+
+
+def test_job_columns_line_up(output: io.StringIO) -> None:
+    for job_id, place in ((1, "a"), (12345, "a-longer-channel")):
+        logs.log_job(
+            "job_ready",
+            job_id=job_id,
+            status="ready",
+            scenario="s",
+            rule="r",
+            place=place,
+            post_count=20,
+        )
+    first, second = output.getvalue().splitlines()
+    for column in ("job=", "status=", "scenario=", "rule=", "place=", "posts="):
+        assert first.index(column) == second.index(column)
+
+
+def test_job_without_a_place_shows_null(output: io.StringIO) -> None:
+    logs.log_job(
+        "job_joined", job_id=1, status="ready", scenario="s", rule="r", place=None, post_count=2
+    )
+    assert "place=null posts=2\n" in squeezed(output.getvalue())
+
+
 def test_lifecycle_columns_line_up(output: io.StringIO) -> None:
     logs.log_lifecycle("startup")
     logs.log_lifecycle("catchup_truncated", reason="unreachable", status=503, count=20)
@@ -100,7 +140,7 @@ def test_long_text_is_cut(output: io.StringIO) -> None:
     assert "x" * (logs.MAX_LOGGED_TEXT + 1) not in output.getvalue()
 
 
-@pytest.mark.parametrize("function", [logs.log_post, logs.log_lifecycle])
+@pytest.mark.parametrize("function", [logs.log_post, logs.log_job, logs.log_lifecycle])
 def test_no_parameter_can_carry_text_or_secrets(function: object) -> None:
     assert callable(function)
     allowed = {
@@ -111,6 +151,9 @@ def test_no_parameter_can_carry_text_or_secrets(function: object) -> None:
         "length",
         "rule",
         "scenario",
+        "job_id",
+        "place",
+        "post_count",
         "reason",
         "error",
         "status",

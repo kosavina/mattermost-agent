@@ -1,13 +1,16 @@
 """One plain log line per event.
 
-The parameters of log_post and log_lifecycle are the allow-list of what can be logged. Neither
-has a parameter for message text, a token or a header, so calling code has no way to pass them.
+The parameters of log_post, log_job and log_lifecycle are the allow-list of what can be logged.
+None has a parameter for message text, a token or a header, so calling code has no way to pass
+them.
 """
 
 import json
 import logging
 import sys
 from typing import Literal, TextIO
+
+from mattermost_agent.store import JobStatus
 
 LOGGER_NAME = "mattermost_agent"
 # At DEBUG these print request headers and WebSocket frames, so LOG_LEVEL must not reach them.
@@ -18,6 +21,7 @@ NO_VALUE = "null"
 logger = logging.getLogger(LOGGER_NAME)
 
 type PostEvent = Literal["post", "cap_hit"]
+type JobEvent = Literal["job_opened", "job_joined", "job_ready"]
 type LifecycleEvent = Literal[
     "startup",
     "connected",
@@ -29,6 +33,7 @@ type LifecycleEvent = Literal[
     "channel_skipped",
     "lookup_failed",
     "frame_skipped",
+    "jobs_pruned",
     "shutdown",
     "stopped",
     "internal_error",
@@ -84,6 +89,29 @@ def log_post(
         length,
         _quoted(rule),
         _quoted(scenario),
+    )
+
+
+def log_job(
+    event: JobEvent,
+    *,
+    job_id: int,
+    status: JobStatus,
+    scenario: str,
+    rule: str,
+    place: str | None,
+    post_count: int,
+) -> None:
+    """Write the one line for a change to a job. Nothing of its posts is logged but their number."""
+    logger.info(
+        "event=%-10s job=%-5d status=%-10s scenario=%-10s rule=%-18s place=%-26s posts=%d",
+        event,
+        job_id,
+        status,
+        _quoted(scenario),
+        _quoted(rule),
+        _quoted(place),
+        post_count,
     )
 
 

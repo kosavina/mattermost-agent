@@ -30,11 +30,11 @@ from mattermost_agent.events import (
     dm_partner,
     parse_websocket_message,
 )
-from mattermost_agent.logs import log_lifecycle, log_post
+from mattermost_agent.logs import JobEvent, log_job, log_lifecycle, log_post
 from mattermost_agent.mattermost import MattermostClient, MattermostError
 from mattermost_agent.rules import RuleSet, first_match
 from mattermost_agent.settings import DEFAULT_STATE_DIR
-from mattermost_agent.store import RETENTION_MS, Store, StoreError
+from mattermost_agent.store import RETENTION_MS, Job, Store, StoreError
 
 # Catch-up starts this far before last-seen, because the clocks of servers can differ a little.
 OVERLAP_MS = 5 * 60 * 1000
@@ -43,7 +43,9 @@ MAX_BACKOFF_DOUBLINGS = 6
 # A call that may work a moment later is tried again after each of these waits.
 RETRY_DELAYS_SECONDS = (1.0, 2.0)
 HEARTBEAT_FILE = "heartbeat"
-HEARTBEAT_SECONDS = 15.0
+# The heartbeat and the check for bursts that became ready share one loop, so this is also how
+# late, at most, a burst is marked ready after its quiet time.
+HOUSEKEEPING_SECONDS = 5.0
 HEARTBEAT_MAX_AGE_SECONDS = 45.0
 PRUNE_SECONDS = 3600.0
 # Docker kills the container 10 seconds after asking it to stop. This gets there first, in case
@@ -139,6 +141,18 @@ async def _logged_channel(runtime: Runtime, me: Me, post: Post, *, live: bool) -
     return None if username is None else f"@{username}"
 
 
+def _log_job(event: JobEvent, job: Job) -> None:
+    log_job(
+        event,
+        job_id=job.id,
+        status=job.status,
+        scenario=job.scenario,
+        rule=job.rule,
+        place=job.place,
+        post_count=job.post_count,
+    )
+
+
 async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> None:
     if is_ignored(post):
         return
@@ -169,6 +183,10 @@ async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> N
         rule=None if rule is None else rule.name,
         scenario=None if rule is None else rule.scenario,
     )
+    if outcome.job is not None:
+        _log_job("job_opened" if outcome.claim == "opened" else "job_joined", outcome.job)
+    for job in outcome.closed:
+        _log_job("job_ready", job)
 
 
 def _needs_catch_up(channel: Channel, named: frozenset[str], floor: int) -> bool:
@@ -269,7 +287,7 @@ def _beat(path: Path) -> None:
 
 
 async def _housekeeping(runtime: Runtime) -> None:
-    """Prove the process is alive, and forget old posts now and then.
+    """Prove the process is alive, mark quiet bursts ready, and forget old posts and jobs hourly.
 
     A Mattermost outage does not stop the heartbeat, because restarting would not fix it.
     The logs show outages, and the heartbeat shows only that the process is stuck.
@@ -278,10 +296,14 @@ async def _housekeeping(runtime: Runtime) -> None:
     while True:
         _beat(runtime.heartbeat_file)
         now = runtime.clock()
+        for job in runtime.store.flip_ready(now):
+            _log_job("job_ready", job)
         if last_pruned is None or now - last_pruned >= PRUNE_SECONDS:
-            runtime.store.prune(now)
+            pruned = runtime.store.prune(now)
+            if pruned.jobs:
+                log_lifecycle("jobs_pruned", count=pruned.jobs)
             last_pruned = now
-        await asyncio.sleep(HEARTBEAT_SECONDS)
+        await asyncio.sleep(HOUSEKEEPING_SECONDS)
 
 
 def healthcheck(env: Mapping[str, str]) -> int:

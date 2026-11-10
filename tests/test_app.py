@@ -24,7 +24,14 @@ from mattermost_agent import app
 from mattermost_agent.logs import configure_logging
 from mattermost_agent.mattermost import MattermostClient, MattermostError, open_events
 from mattermost_agent.rules import Bursts, parse_rules
-from mattermost_agent.store import FILE_NAME, RETENTION_MS, Store, StoreError
+from mattermost_agent.store import (
+    FILE_NAME,
+    JOB_RETENTION_SECONDS,
+    RETENTION_MS,
+    Store,
+    StoreError,
+    read_jobs,
+)
 
 TOKEN = "abcdefghijklmnopqrstuvwxyz"
 SECRET_TEXT = "sentinel-private-message"
@@ -51,10 +58,14 @@ type Scenario = Callable[[], Awaitable[None]]
 
 @dataclass
 class Script:
-    """What the fake server does on one connection, after its hello."""
+    """What the fake server does on one connection, after its hello.
+
+    It sends `frames`, runs `after`, sends `more`, then closes or waits for the client to.
+    """
 
     frames: list[str] = field(default_factory=list)
     after: Scenario | None = None
+    more: list[str] = field(default_factory=list)
     close: bool = False
 
 
@@ -120,6 +131,8 @@ class World:
             await connection.send(frame)
         if script.after is not None:
             await script.after()
+        for frame in script.more:
+            await connection.send(frame)
         if script.close:
             await connection.close()
         else:
@@ -327,6 +340,51 @@ def test_my_own_post_is_found_by_catch_up(world: World) -> None:
     world.scripts = [Script([frame("first", LATER + 10)], after=lose_connection, close=True)]
     world.go(lambda: until(lambda: world.handled("mine")))
     assert 'channel="@example.user" sender="example.me"' in world.lines("post")[1]
+
+
+def test_three_quick_posts_make_one_job(world: World) -> None:
+    posts = [frame(post_id, LATER + n, message=SECRET_TEXT) for n, post_id in enumerate("abc")]
+    world.scripts = [Script(posts)]
+    world.go(lambda: until(lambda: world.handled("c")))
+    jobs = read_jobs(world.store.path)
+    assert [(job.id, job.status, job.post_count) for job in jobs] == [(1, "collecting", 3)]
+    assert len(world.lines("post")) == 3
+    assert len(world.lines("job_opened")) == 1
+    assert len(world.lines("job_joined")) == 2
+    assert (
+        'job=1 status=collecting scenario="intake" rule="dm-from-anyone" place="@example.user" '
+        "posts=3" in world.lines("job_joined")[1]
+    )
+    assert world.lines("job_ready") == []
+    assert SECRET_TEXT not in world.log
+
+
+def test_a_quiet_burst_becomes_ready_and_the_next_post_opens_a_new_job(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app, "HOUSEKEEPING_SECONDS", 0.01)
+
+    def status_of(job_id: int) -> str | None:
+        found = [job for job in read_jobs(world.store.path) if job.id == job_id]
+        return found[0].status if found else None
+
+    async def wait_for_quiet() -> None:
+        await until(lambda: world.handled("c"))
+        world.now += BURSTS.quiet_seconds + 1
+        await until(lambda: status_of(1) == "ready")
+
+    posts = [frame(post_id, LATER + n, message=SECRET_TEXT) for n, post_id in enumerate("abc")]
+    world.scripts = [Script(posts, after=wait_for_quiet, more=[frame("d", LATER + 3)])]
+    world.go(lambda: until(lambda: world.handled("d")))
+    jobs = read_jobs(world.store.path)
+    assert [(job.id, job.status, job.post_count) for job in jobs] == [
+        (2, "collecting", 1),
+        (1, "ready", 3),
+    ]
+    assert len(world.lines("job_ready")) == 1
+    assert "job=1 status=ready" in world.lines("job_ready")[0]
+    assert "job=2 status=collecting" in world.lines("job_opened")[1]
+    assert SECRET_TEXT not in world.log
 
 
 def test_a_system_post_is_skipped(world: World) -> None:
@@ -702,7 +760,7 @@ def test_nothing_secret_reaches_the_log_even_at_debug(world: World) -> None:
 
 
 def test_the_heartbeat_file_is_refreshed(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(app, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(app, "HOUSEKEEPING_SECONDS", 0.01)
     path = world.tmp_path / "state" / app.HEARTBEAT_FILE
 
     async def scenario() -> None:
@@ -716,7 +774,7 @@ def test_the_heartbeat_file_is_refreshed(world: World, monkeypatch: pytest.Monke
 def test_the_heartbeat_continues_during_an_outage(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(app, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(app, "HOUSEKEEPING_SECONDS", 0.01)
     world.connect_failures = [MattermostError("unreachable") for _ in range(10_000)]
     path = world.tmp_path / "state" / app.HEARTBEAT_FILE
 
@@ -749,6 +807,18 @@ def test_old_posts_are_pruned_at_startup(world: World) -> None:
         ancient, kind="dm", rule=None, place=None, live=False, now=NOW - 7200, cap=20, bursts=BURSTS
     )
     world.go(lambda: until(lambda: not world.handled("ancient")))
+
+
+def test_old_jobs_are_pruned_at_startup(world: World) -> None:
+    old = make_post(id="old", create_at=NOW_MS - 1000, message=SECRET_TEXT)
+    rule = parse_rules(RULES).rules[1]
+    opened = NOW - JOB_RETENTION_SECONDS - 1
+    world.store.claim(
+        old, kind="channel", rule=rule, place=None, live=False, now=opened, cap=20, bursts=BURSTS
+    )
+    world.go(lambda: until(lambda: read_jobs(world.store.path) == []))
+    assert "count=1" in world.lines("jobs_pruned")[0]
+    assert SECRET_TEXT not in world.log
 
 
 def test_healthcheck_passes_on_a_fresh_file(tmp_path: Path) -> None:
