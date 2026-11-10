@@ -271,7 +271,7 @@ def test_a_mention_is_recognised(world: World) -> None:
     world.scripts = [Script([json.dumps(event)])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'kind=mention channel="random"' in world.lines("post")[0]
-    # No rule names the channel, and a mention alone is no longer a condition.
+    # Being mentioned is not a condition, and no rule names the channel.
     assert "rule=null" in world.lines("post")[0]
 
 
@@ -523,6 +523,35 @@ def test_catch_up_reads_only_dms_and_named_channels_with_new_posts(world: World)
         "/api/v4/channels/named/posts",
     ]
     assert "count=3" in world.lines("catchup_start")[0]
+
+
+def test_catch_up_lets_other_tasks_run_between_posts(world: World) -> None:
+    """A long catch-up must not starve the heartbeat and the socket's keep-alive pings."""
+    world.store.set_first_last_seen(NOW_MS)
+    world.channels = [channel("dm", last_post_at=NOW_MS + 5)]
+    world.posts = {
+        "dm": [raw_post(id=f"p{n}", channel_id="dm", create_at=NOW_MS + 5 + n) for n in range(200)]
+    }
+    turns = 0
+
+    async def scenario() -> None:
+        nonlocal turns
+
+        async def count_turns() -> None:
+            nonlocal turns
+            while True:
+                if world.lines("catchup_start") and not world.lines("catchup_done"):
+                    turns += 1
+                await asyncio.sleep(0)
+
+        counter = asyncio.create_task(count_turns())
+        try:
+            await until(lambda: "event=catchup_done" in world.log)
+        finally:
+            counter.cancel()
+
+    world.go(scenario)
+    assert turns >= 200
 
 
 def test_the_first_run_reads_no_history(world: World) -> None:

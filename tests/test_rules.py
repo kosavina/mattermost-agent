@@ -166,27 +166,6 @@ def test_dm_false_is_refused_with_advice() -> None:
 
 
 @pytest.mark.parametrize(
-    ("condition", "message"),
-    [
-        ("kind: dm", "rule 1 uses kind, which was removed: use dm: true or channels"),
-        (
-            "keywords: [metric]",
-            "rule 1 uses keywords, which was removed: match on dm, channels and from instead",
-        ),
-    ],
-)
-def test_a_rule_in_the_old_format_names_the_removed_key(condition: str, message: str) -> None:
-    with pytest.raises(RulesError, match=f"^{message}$"):
-        rules_of(f"name: r, {condition}, scenario: a")
-
-
-def test_an_old_limit_names_the_removed_key() -> None:
-    message = "limits uses matches_per_hour, which was removed: use jobs_per_hour"
-    with pytest.raises(RulesError, match=f"^{message}$"):
-        parse_rules(ONE_RULE + "limits: {matches_per_hour: 20}\n" + BURSTS)
-
-
-@pytest.mark.parametrize(
     "text",
     [
         "",

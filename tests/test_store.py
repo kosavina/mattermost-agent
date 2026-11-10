@@ -28,13 +28,6 @@ INTAKE = Rule(name="intake", scenario="triage", dm=False, channels=frozenset(), 
 REVIEW = Rule(name="review", scenario="check", dm=False, channels=frozenset(), senders=frozenset())
 SECRET_WORD = "zebraquartz"
 
-# The schema of version 1, as the first release created it.
-SCHEMA_V1 = (
-    "CREATE TABLE handled (post_id TEXT PRIMARY KEY, create_at INTEGER NOT NULL, matched_at REAL)",
-    "CREATE INDEX handled_matched_at ON handled (matched_at) WHERE matched_at IS NOT NULL",
-    "CREATE TABLE last_seen (id INTEGER PRIMARY KEY CHECK (id = 1), create_at INTEGER NOT NULL)",
-)
-
 
 @pytest.fixture
 def path(tmp_path: Path) -> Path:
@@ -222,6 +215,18 @@ def test_another_rule_closes_the_job_and_opens_a_new_one(store: Store, path: Pat
     assert [(job.id, job.status, job.rule) for job in outcome.closed] == [(1, "ready", "intake")]
     assert jobs(path) == [(1, "ready", 1), (2, "collecting", 1)]
     assert query(path, "SELECT rule, scenario FROM jobs WHERE id = 2") == [("review", "check")]
+
+
+def test_a_changed_scenario_closes_the_job_and_opens_a_new_one(store: Store, path: Path) -> None:
+    # The rules file was edited between the two posts: same rule name, another scenario.
+    claim(store, "a", rule=INTAKE)
+    renamed = Rule(
+        name="intake", scenario="other", dm=False, channels=frozenset(), senders=frozenset()
+    )
+    outcome = claim(store, "b", rule=renamed, now=NOW + 1)
+    assert outcome.claim == "opened"
+    assert [(job.id, job.status) for job in outcome.closed] == [(1, "ready")]
+    assert query(path, "SELECT id, scenario FROM jobs ORDER BY id") == [(1, "triage"), (2, "other")]
 
 
 def test_an_unmatched_post_never_joins_a_job(store: Store, path: Path) -> None:
@@ -497,38 +502,6 @@ def test_an_unknown_schema_version_fails_at_startup(store: Store, path: Path) ->
         Store(path)
 
 
-def version_1_file(path: Path) -> None:
-    path.parent.mkdir()
-    connection = sqlite3.connect(path, isolation_level=None)
-    try:
-        connection.execute("PRAGMA journal_mode = WAL")
-        for statement in SCHEMA_V1:
-            connection.execute(statement)
-        connection.execute("INSERT INTO handled VALUES ('seen', 1000, NULL), ('hit', 2000, 5.0)")
-        connection.execute("INSERT INTO last_seen VALUES (1, 3000)")
-        connection.execute("PRAGMA user_version = 1")
-    finally:
-        connection.close()
-
-
-def test_a_version_1_file_is_migrated_in_place(path: Path) -> None:
-    version_1_file(path)
-    store = Store(path)
-    assert query(path, "PRAGMA user_version") == [(2,)]
-    assert query(path, "SELECT post_id, create_at FROM handled ORDER BY post_id") == [
-        ("hit", 2000),
-        ("seen", 1000),
-    ]
-    assert [column[1] for column in query(path, "PRAGMA table_info(handled)")] == [
-        "post_id",
-        "create_at",
-    ]
-    assert store.last_seen() == 3000
-    assert claim(store, "seen").claim == "duplicate"
-    assert claim(store, "a").claim == "opened"
-    assert Store(path).last_seen() == 3000
-
-
 def test_a_failure_later_on_raises_store_error(store: Store, path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("root can write anywhere")
@@ -583,7 +556,11 @@ def test_reading_a_missing_database_fails_clearly(tmp_path: Path) -> None:
         read_jobs(tmp_path / FILE_NAME)
 
 
-def test_reading_an_old_database_says_to_start_the_listener(path: Path) -> None:
-    version_1_file(path)
-    with pytest.raises(StoreError, match="schema version 1, not 2: start the listener once"):
+def test_reading_a_database_of_another_version_fails_clearly(store: Store, path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("PRAGMA user_version = 99")
+    finally:
+        connection.close()
+    with pytest.raises(StoreError, match="unknown schema version 99"):
         read_jobs(path)
