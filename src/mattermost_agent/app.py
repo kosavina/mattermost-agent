@@ -145,14 +145,14 @@ async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> N
     kind = classify(post, me)
     sender = await _username(runtime, post.user_id, live=live)
     channel = await _logged_channel(runtime, me, post, live=live)
-    rule = first_match(runtime.rules, post, kind, sender, own=is_own(post, me))
+    rule = first_match(runtime.rules, post, sender, own=is_own(post, me))
     claim = runtime.store.claim(
         post.id,
         post.create_at,
         matched=rule is not None,
         live=live,
         now=runtime.clock(),
-        cap=runtime.rules.matches_per_hour,
+        cap=runtime.rules.jobs_per_hour,
     )
     if claim == "duplicate":
         return

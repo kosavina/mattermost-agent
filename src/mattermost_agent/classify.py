@@ -1,12 +1,11 @@
 """Decide which posts to look at, and what kind each one is."""
 
 import re
-from typing import Literal, get_args
+from typing import Literal
 
 from mattermost_agent.events import Me, Post
 
 type Kind = Literal["dm", "group_dm", "mention", "thread_reply", "channel"]
-KINDS: frozenset[str] = frozenset(get_args(Kind.__value__))
 
 
 def is_own(post: Post, me: Me) -> bool:

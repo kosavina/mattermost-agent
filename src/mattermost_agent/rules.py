@@ -1,6 +1,6 @@
 """Read rules.yaml, refuse anything doubtful, and find the first rule that matches a post.
 
-Validation is strict because a mistake here fails silently otherwise: a misspelt `keyword:` would
+Validation is strict because a mistake here fails silently otherwise: a misspelt `channel:` would
 be ignored, leaving a rule that matches far more than intended. Errors give the rule's number or
 a line number, never a piece of the file.
 """
@@ -13,13 +13,20 @@ from typing import cast
 
 import yaml
 
-from mattermost_agent.classify import KINDS, Kind
 from mattermost_agent.events import Post
 
-TOP_LEVEL_KEYS = frozenset({"rules", "limits"})
-LIMIT_KEYS = frozenset({"matches_per_hour"})
-RULE_KEYS = frozenset({"name", "scenario", "kind", "channels", "from", "keywords"})
-CONDITION_KEYS = frozenset({"kind", "channels", "from", "keywords"})
+TOP_LEVEL_KEYS = frozenset({"rules", "limits", "bursts"})
+LIMIT_KEYS = frozenset({"jobs_per_hour"})
+BURST_KEYS = ("quiet_seconds", "max_wait_seconds", "max_posts")
+RULE_KEYS = frozenset({"name", "scenario", "dm", "channels", "from"})
+CONDITION_KEYS = frozenset({"dm", "channels", "from"})
+# Keys of the first format. The error names them, because "unknown key" alone would not tell a
+# reader that the format changed. These are fixed words, never a piece of the file.
+REMOVED_KEYS = {
+    "kind": "use dm: true or channels",
+    "keywords": "match on dm, channels and from instead",
+    "matches_per_hour": "use jobs_per_hour",
+}
 
 CHANNEL_NAME = re.compile(r"[a-z0-9_-]+", re.IGNORECASE)
 USERNAME = re.compile(r"[a-z0-9._-]+", re.IGNORECASE)
@@ -31,20 +38,29 @@ class RulesError(Exception):
 
 @dataclass(frozen=True)
 class Rule:
-    """One rule. Empty means "any". Channels, senders and keywords are in lower case."""
+    """One rule. `dm` False and an empty set mean "any". Channels and senders are in lower case."""
 
     name: str
     scenario: str
-    kind: Kind | None
+    dm: bool
     channels: frozenset[str]
     senders: frozenset[str]
-    keywords: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Bursts:
+    """When a burst of posts is complete. Whole numbers, at least 1."""
+
+    quiet_seconds: int
+    max_wait_seconds: int
+    max_posts: int
 
 
 @dataclass(frozen=True)
 class RuleSet:
     rules: tuple[Rule, ...]
-    matches_per_hour: int
+    jobs_per_hour: int
+    bursts: Bursts
 
     @property
     def channel_names(self) -> frozenset[str]:
@@ -82,6 +98,9 @@ def _parse_yaml(text: str) -> object:
 def _mapping(value: object, where: str, allowed: frozenset[str]) -> dict[str, object]:
     if not isinstance(value, dict):
         raise RulesError(f"{where} must be a mapping")
+    for key in value:
+        if key in REMOVED_KEYS:
+            raise RulesError(f"{where} uses {key}, which was removed: {REMOVED_KEYS[key]}")
     unknown = [key for key in value if key not in allowed]
     if unknown:
         raise RulesError(f"{where} has an unknown key; allowed: {', '.join(sorted(allowed))}")
@@ -94,14 +113,21 @@ def _text(value: object, where: str) -> str:
     return value
 
 
-def _text_list(value: object, where: str, pattern: re.Pattern[str] | None = None) -> list[str]:
-    """Return a non-empty list of lower-case text, each item matching `pattern` if given."""
+def _text_list(value: object, where: str, pattern: re.Pattern[str]) -> list[str]:
+    """Return a non-empty list of lower-case text, each item matching `pattern`."""
     if not isinstance(value, list) or not value:
         raise RulesError(f"{where} must be a list with at least one item")
     items = [_text(item, f"{where} item").casefold() for item in value]
-    if pattern is not None and not all(pattern.fullmatch(item) for item in items):
+    if not all(pattern.fullmatch(item) for item in items):
         raise RulesError(f"{where} must hold plain names, with no @, ~ or spaces")
     return items
+
+
+def _whole_number(value: object, where: str) -> int:
+    # `type` and not isinstance: YAML `true` is a bool, and a bool is a kind of int in Python.
+    if type(value) is not int or value < 1:
+        raise RulesError(f"{where} must be a whole number, at least 1")
+    return value
 
 
 def _rule(value: object, number: int) -> Rule:
@@ -109,13 +135,16 @@ def _rule(value: object, number: int) -> Rule:
     raw = _mapping(value, where, RULE_KEYS)
     if not CONDITION_KEYS & raw.keys():
         raise RulesError(f"{where} needs at least one of: {', '.join(sorted(CONDITION_KEYS))}")
-    kind = raw.get("kind")
-    if "kind" in raw and (not isinstance(kind, str) or kind not in KINDS):
-        raise RulesError(f"{where} kind must be one of: {', '.join(sorted(KINDS))}")
+    dm = "dm" in raw
+    # `is True` and not truthiness: 1, "true" or [true] must not pass as true.
+    if dm and raw["dm"] is not True:
+        raise RulesError(f"{where} dm must be true, or left out")
+    if dm and "channels" in raw:
+        raise RulesError(f"{where} sets both dm and channels, which no post can match")
     return Rule(
         name=_text(raw.get("name"), f"{where} name"),
         scenario=_text(raw.get("scenario"), f"{where} scenario"),
-        kind=cast(Kind | None, kind),
+        dm=dm,
         channels=frozenset(
             _text_list(raw["channels"], f"{where} channels", CHANNEL_NAME)
             if "channels" in raw
@@ -124,10 +153,15 @@ def _rule(value: object, number: int) -> Rule:
         senders=frozenset(
             _text_list(raw["from"], f"{where} from", USERNAME) if "from" in raw else ()
         ),
-        keywords=tuple(_text_list(raw["keywords"], f"{where} keywords"))
-        if "keywords" in raw
-        else (),
     )
+
+
+def _bursts(value: object) -> Bursts:
+    raw = _mapping(value, "bursts", frozenset(BURST_KEYS))
+    bursts = Bursts(*(_whole_number(raw.get(key), f"bursts {key}") for key in BURST_KEYS))
+    if bursts.quiet_seconds > bursts.max_wait_seconds:
+        raise RulesError("bursts quiet_seconds must be at most max_wait_seconds")
+    return bursts
 
 
 def parse_rules(text: str) -> RuleSet:
@@ -141,11 +175,8 @@ def parse_rules(text: str) -> RuleSet:
         raise RulesError("two rules have the same name")
 
     limits = _mapping(top.get("limits"), "limits", LIMIT_KEYS)
-    cap = limits.get("matches_per_hour")
-    # `type` and not isinstance: YAML `true` is a bool, and a bool is a kind of int in Python.
-    if type(cap) is not int or cap < 1:
-        raise RulesError("limits matches_per_hour must be a whole number, at least 1")
-    return RuleSet(rules=rules, matches_per_hour=cap)
+    cap = _whole_number(limits.get("jobs_per_hour"), "limits jobs_per_hour")
+    return RuleSet(rules=rules, jobs_per_hour=cap, bursts=_bursts(top.get("bursts")))
 
 
 def load_rules(path: Path) -> RuleSet:
@@ -160,28 +191,18 @@ def load_rules(path: Path) -> RuleSet:
         raise RulesError(f"the rules file {path}: {error}") from None
 
 
-def _matches(rule: Rule, post: Post, kind: Kind, sender: str | None, *, own: bool) -> bool:
+def _matches(rule: Rule, post: Post, sender: str | None, *, own: bool) -> bool:
     """Every condition the rule sets must hold. Within a list, any one item is enough."""
-    # A post of mine needs a rule that names me, or `kind: dm` would also match the DMs I send.
+    # A post of mine needs a rule that names me, or `dm: true` would also match the DMs I send.
     if own and not rule.senders:
         return False
-    if rule.kind is not None and rule.kind != kind:
+    if rule.dm and post.channel_type != "D":
         return False
     if rule.channels and post.channel_name.casefold() not in rule.channels:
         return False
-    if rule.senders and (sender is None or sender.casefold() not in rule.senders):
-        return False
-    if rule.keywords:
-        # Part of a word counts, so that Russian endings match: "дашборд" finds "дашборде".
-        text = post.message.casefold()
-        return any(keyword in text for keyword in rule.keywords)
-    return True
+    return not rule.senders or (sender is not None and sender.casefold() in rule.senders)
 
 
-def first_match(
-    rule_set: RuleSet, post: Post, kind: Kind, sender: str | None, *, own: bool
-) -> Rule | None:
+def first_match(rule_set: RuleSet, post: Post, sender: str | None, *, own: bool) -> Rule | None:
     """Return the first rule that matches, in file order, or None."""
-    return next(
-        (rule for rule in rule_set.rules if _matches(rule, post, kind, sender, own=own)), None
-    )
+    return next((rule for rule in rule_set.rules if _matches(rule, post, sender, own=own)), None)

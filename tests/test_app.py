@@ -33,15 +33,14 @@ NOW_MS = 2_000_000_000_000
 # Later than where a first run sets last-seen, so that these posts count as new.
 LATER = NOW_MS + 10 * 60 * 1000
 
-RULES = """
+BURSTS = "bursts: {quiet_seconds: 90, max_wait_seconds: 600, max_posts: 20}\n"
+RULES = f"""
 rules:
-  - {name: dm-from-anyone, kind: dm, scenario: intake}
-  - {name: mentions-me, kind: mention, scenario: intake}
-  - {name: analytics, channels: [analytics], keywords: [dashboard], scenario: review}
-  - {name: named-sender, from: [example.user], keywords: [urgent], scenario: review}
-limits:
-  matches_per_hour: 20
-"""
+  - {{name: dm-from-anyone, dm: true, scenario: intake}}
+  - {{name: analytics, channels: [analytics], scenario: review}}
+  - {{name: named-sender, channels: [requests], from: [example.user], scenario: review}}
+limits: {{jobs_per_hour: 20}}
+{BURSTS}"""
 
 type Scenario = Callable[[], Awaitable[None]]
 
@@ -226,9 +225,7 @@ def test_a_live_post_is_logged_once(world: World) -> None:
 
 
 def test_a_channel_post_logs_its_channel_name(world: World) -> None:
-    world.scripts = [
-        Script([frame("a", channel_type="O", channel_name="analytics", message="new dashboard")])
-    ]
+    world.scripts = [Script([frame("a", channel_type="O", channel_name="analytics")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'kind=channel channel="analytics"' in world.lines("post")[0]
     assert 'rule="analytics" scenario="review"' in world.lines("post")[0]
@@ -257,7 +254,8 @@ def test_a_mention_is_recognised(world: World) -> None:
     world.scripts = [Script([json.dumps(event)])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'kind=mention channel="random"' in world.lines("post")[0]
-    assert 'rule="mentions-me"' in world.lines("post")[0]
+    # No rule names the channel, and a mention alone is no longer a condition.
+    assert "rule=null" in world.lines("post")[0]
 
 
 def test_my_own_dm_is_logged_with_who_it_went_to(world: World) -> None:
@@ -294,12 +292,12 @@ def test_where_my_own_private_message_went(
 
 
 def test_my_own_post_matches_only_a_rule_that_names_me(world: World) -> None:
-    world.rules_text = """
+    world.rules_text = f"""
 rules:
-  - {name: from-others, kind: dm, scenario: one}
-  - {name: from-me, kind: dm, from: [example.me], scenario: two}
-limits: {matches_per_hour: 5}
-"""
+  - {{name: from-others, dm: true, scenario: one}}
+  - {{name: from-me, dm: true, from: [example.me], scenario: two}}
+limits: {{jobs_per_hour: 5}}
+{BURSTS}"""
     world.scripts = [Script([frame("a", user_id="me-id")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'rule="from-me" scenario="two"' in world.lines("post")[0]
@@ -343,9 +341,9 @@ def test_a_post_sent_twice_is_logged_once(world: World) -> None:
 def test_the_sender_is_the_real_user_and_not_the_name_in_the_event(world: World) -> None:
     world.users["webhook-owner"] = "actual.owner"
     event = posted_event(
-        raw_post(id="a", create_at=LATER, user_id="webhook-owner", message="urgent"),
+        raw_post(id="a", create_at=LATER, user_id="webhook-owner"),
         channel_type="O",
-        channel_name="random",
+        channel_name="requests",
         sender_name="@example.user",
     )
     world.scripts = [Script([json.dumps(event)])]
@@ -355,23 +353,23 @@ def test_the_sender_is_the_real_user_and_not_the_name_in_the_event(world: World)
 
 
 def test_the_first_matching_rule_wins_in_the_loop(world: World) -> None:
-    world.rules_text = """
+    world.rules_text = f"""
 rules:
-  - {name: first, kind: dm, scenario: one}
-  - {name: second, kind: dm, scenario: two}
-limits: {matches_per_hour: 5}
-"""
+  - {{name: first, dm: true, scenario: one}}
+  - {{name: second, dm: true, scenario: two}}
+limits: {{jobs_per_hour: 5}}
+{BURSTS}"""
     world.scripts = [Script([frame("a")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'rule="first" scenario="one"' in world.lines("post")[0]
 
 
 def test_a_match_over_the_cap_is_logged_as_cap_hit(world: World) -> None:
-    world.rules_text = """
+    world.rules_text = f"""
 rules:
-  - {name: dm, kind: dm, scenario: intake}
-limits: {matches_per_hour: 1}
-"""
+  - {{name: dm, dm: true, scenario: intake}}
+limits: {{jobs_per_hour: 1}}
+{BURSTS}"""
     world.scripts = [Script([frame("a"), frame("b", LATER + 1)])]
     world.go(lambda: until(lambda: world.handled("b")))
     assert len(world.lines("post")) == 1

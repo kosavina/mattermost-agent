@@ -1,28 +1,29 @@
 # Copy this file to rules.yaml and edit it. The names below are made up.
 #
-# Rules are checked from top to bottom, and the first match wins. A post is logged either way.
-# Every condition a rule sets must hold; within a list, any one item is enough.
+# Rules are checked from top to bottom, and the first match wins. A post is logged either way, and
+# only a matched post goes into a job. Every condition a rule sets must hold; within a list, any
+# one item is enough.
 #
-#   kind      dm, group_dm, mention, thread_reply or channel
+#   dm        true: a direct message between two people; group messages do not count. Leave it
+#             out otherwise, because dm: false is refused
 #   channels  the name in the channel's URL (town-square), not its title (Town Square)
 #   from      usernames, without the @. Your own posts match only a rule that lists you here
-#   keywords  case-insensitive; part of a word counts, so "metric" also finds "metrics"
-#   scenario  a label for later milestones; it is only logged for now
+#   scenario  a label for the processor; it is kept with the job and logged
 #
 # Quote words that YAML reads as something else: "on", "off", "yes", "no", "null", or a number.
 rules:
   - name: dm-from-anyone
-    kind: dm
+    dm: true
     scenario: intake
-  - name: mentions-me
-    kind: mention
-    scenario: intake
-  - name: analytics-keywords
+  - name: analytics-requests
     channels: [analytics]
     from: [example.user]
-    keywords: [dashboard, metric]
     scenario: intake
 
 limits:
-  # At most this many matches in any 60 minutes. Further matches are logged as cap_hit.
-  matches_per_hour: 20
+  jobs_per_hour: 20          # new jobs opened in any 60 minutes; posts joining a job don't count
+
+bursts:
+  quiet_seconds: 90          # a burst is ready after this long with no new post
+  max_wait_seconds: 600      # and at the latest this long after its first post
+  max_posts: 20              # and at the latest when it holds this many posts
