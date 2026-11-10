@@ -227,6 +227,9 @@ async def _catch_up(runtime: Runtime, me: Me) -> None:
     posts.sort(key=lambda post: post.create_at)
     for post in posts:
         await _handle_post(runtime, me, post, live=False)
+        # Handling a post need not await anything once the sender is cached, so give the
+        # heartbeat and the socket's keep-alive pings a turn after each one.
+        await asyncio.sleep(0)
     log_lifecycle("catchup_done", count=len(posts))
 
 

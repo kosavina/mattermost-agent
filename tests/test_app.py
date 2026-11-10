@@ -525,6 +525,35 @@ def test_catch_up_reads_only_dms_and_named_channels_with_new_posts(world: World)
     assert "count=3" in world.lines("catchup_start")[0]
 
 
+def test_catch_up_lets_other_tasks_run_between_posts(world: World) -> None:
+    """A long catch-up must not starve the heartbeat and the socket's keep-alive pings."""
+    world.store.set_first_last_seen(NOW_MS)
+    world.channels = [channel("dm", last_post_at=NOW_MS + 5)]
+    world.posts = {
+        "dm": [raw_post(id=f"p{n}", channel_id="dm", create_at=NOW_MS + 5 + n) for n in range(200)]
+    }
+    turns = 0
+
+    async def scenario() -> None:
+        nonlocal turns
+
+        async def count_turns() -> None:
+            nonlocal turns
+            while True:
+                if world.lines("catchup_start") and not world.lines("catchup_done"):
+                    turns += 1
+                await asyncio.sleep(0)
+
+        counter = asyncio.create_task(count_turns())
+        try:
+            await until(lambda: "event=catchup_done" in world.log)
+        finally:
+            counter.cancel()
+
+    world.go(scenario)
+    assert turns >= 200
+
+
 def test_the_first_run_reads_no_history(world: World) -> None:
     world.channels = [channel("dm", last_post_at=NOW_MS)]
     world.posts = {"dm": [raw_post(id="old", channel_id="dm", create_at=NOW_MS - 1000)]}

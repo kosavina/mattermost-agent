@@ -217,6 +217,18 @@ def test_another_rule_closes_the_job_and_opens_a_new_one(store: Store, path: Pat
     assert query(path, "SELECT rule, scenario FROM jobs WHERE id = 2") == [("review", "check")]
 
 
+def test_a_changed_scenario_closes_the_job_and_opens_a_new_one(store: Store, path: Path) -> None:
+    # The rules file was edited between the two posts: same rule name, another scenario.
+    claim(store, "a", rule=INTAKE)
+    renamed = Rule(
+        name="intake", scenario="other", dm=False, channels=frozenset(), senders=frozenset()
+    )
+    outcome = claim(store, "b", rule=renamed, now=NOW + 1)
+    assert outcome.claim == "opened"
+    assert [(job.id, job.status) for job in outcome.closed] == [(1, "ready")]
+    assert query(path, "SELECT id, scenario FROM jobs ORDER BY id") == [(1, "triage"), (2, "other")]
+
+
 def test_an_unmatched_post_never_joins_a_job(store: Store, path: Path) -> None:
     claim(store, "a")
     assert claim(store, "b", rule=None, now=NOW + 1).claim == "unmatched"

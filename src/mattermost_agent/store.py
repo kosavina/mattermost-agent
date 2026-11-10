@@ -262,7 +262,9 @@ class Store:
             if current is not None and current.ready_at <= now:
                 closed.append(_close(connection, current, now))
                 current = None
-            if current is not None and current.rule == rule.name:
+            # The same rule means the same name and scenario: the file may have changed in between.
+            same_rule = current is not None and current.rule == rule.name
+            if current is not None and same_rule and current.scenario == rule.scenario:
                 count = current.post_count + 1
                 status: JobStatus = "ready" if count >= bursts.max_posts else "collecting"
                 ready_at = min(now + bursts.quiet_seconds, current.deadline_at)
@@ -283,7 +285,8 @@ class Store:
             if recent >= cap:
                 return Outcome("cap_hit", closed=tuple(closed))
             if current is not None:
-                # Opened by another rule. The post opens its own job, so this one is complete.
+                # Opened by another rule, or by this rule with another scenario. The post opens
+                # its own job, so this one is complete.
                 closed.append(_close(connection, current, now))
             status = "ready" if bursts.max_posts <= 1 else "collecting"
             job = Job(
