@@ -16,14 +16,14 @@ from typing import Any
 
 import httpx2
 import pytest
-from helpers import captured_logs, posted_event, raw_post, squeezed
+from helpers import captured_logs, make_post, posted_event, raw_post, squeezed
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 from mattermost_agent import __main__ as entry
 from mattermost_agent import app
 from mattermost_agent.logs import configure_logging
 from mattermost_agent.mattermost import MattermostClient, MattermostError, open_events
-from mattermost_agent.rules import parse_rules
+from mattermost_agent.rules import Bursts, parse_rules
 from mattermost_agent.store import FILE_NAME, RETENTION_MS, Store, StoreError
 
 TOKEN = "abcdefghijklmnopqrstuvwxyz"
@@ -33,14 +33,18 @@ NOW_MS = 2_000_000_000_000
 # Later than where a first run sets last-seen, so that these posts count as new.
 LATER = NOW_MS + 10 * 60 * 1000
 
-BURSTS = "bursts: {quiet_seconds: 90, max_wait_seconds: 600, max_posts: 20}\n"
+BURSTS = Bursts(quiet_seconds=90, max_wait_seconds=600, max_posts=20)
+BURSTS_TEXT = (
+    f"bursts: {{quiet_seconds: {BURSTS.quiet_seconds}, "
+    f"max_wait_seconds: {BURSTS.max_wait_seconds}, max_posts: {BURSTS.max_posts}}}\n"
+)
 RULES = f"""
 rules:
   - {{name: dm-from-anyone, dm: true, scenario: intake}}
   - {{name: analytics, channels: [analytics], scenario: review}}
   - {{name: named-sender, channels: [requests], from: [example.user], scenario: review}}
 limits: {{jobs_per_hour: 20}}
-{BURSTS}"""
+{BURSTS_TEXT}"""
 
 type Scenario = Callable[[], Awaitable[None]]
 
@@ -297,7 +301,7 @@ rules:
   - {{name: from-others, dm: true, scenario: one}}
   - {{name: from-me, dm: true, from: [example.me], scenario: two}}
 limits: {{jobs_per_hour: 5}}
-{BURSTS}"""
+{BURSTS_TEXT}"""
     world.scripts = [Script([frame("a", user_id="me-id")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'rule="from-me" scenario="two"' in world.lines("post")[0]
@@ -358,7 +362,7 @@ rules:
   - {{name: first, dm: true, scenario: one}}
   - {{name: second, dm: true, scenario: two}}
 limits: {{jobs_per_hour: 5}}
-{BURSTS}"""
+{BURSTS_TEXT}"""
     world.scripts = [Script([frame("a")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'rule="first" scenario="one"' in world.lines("post")[0]
@@ -369,8 +373,10 @@ def test_a_match_over_the_cap_is_logged_as_cap_hit(world: World) -> None:
 rules:
   - {{name: dm, dm: true, scenario: intake}}
 limits: {{jobs_per_hour: 1}}
-{BURSTS}"""
-    world.scripts = [Script([frame("a"), frame("b", LATER + 1)])]
+{BURSTS_TEXT}"""
+    # A second post in the same DM would join the first job; another DM needs a job of its own.
+    other_dm = frame("b", LATER + 1, channel_name="me-id__third-id", channel_id="channel-2")
+    world.scripts = [Script([frame("a"), other_dm])]
     world.go(lambda: until(lambda: world.handled("b")))
     assert len(world.lines("post")) == 1
     assert len(world.lines("cap_hit")) == 1
@@ -738,7 +744,10 @@ def test_a_heartbeat_that_cannot_be_written_stops_the_app(world: World) -> None:
 def test_old_posts_are_pruned_at_startup(world: World) -> None:
     world.store.set_first_last_seen(NOW_MS)
     old = NOW_MS - RETENTION_MS - 1
-    world.store.claim("ancient", old, matched=False, live=False, now=NOW - 7200, cap=20)
+    ancient = make_post(id="ancient", create_at=old)
+    world.store.claim(
+        ancient, kind="dm", rule=None, place=None, live=False, now=NOW - 7200, cap=20, bursts=BURSTS
+    )
     world.go(lambda: until(lambda: not world.handled("ancient")))
 
 

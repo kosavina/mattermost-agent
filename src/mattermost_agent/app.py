@@ -146,18 +146,22 @@ async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> N
     sender = await _username(runtime, post.user_id, live=live)
     channel = await _logged_channel(runtime, me, post, live=live)
     rule = first_match(runtime.rules, post, sender, own=is_own(post, me))
-    claim = runtime.store.claim(
-        post.id,
-        post.create_at,
-        matched=rule is not None,
+    # Where the job came from, for the jobs listing: the channel, or `@` and the other person.
+    place = channel or (f"@{sender}" if post.channel_type == "D" and sender else None)
+    outcome = runtime.store.claim(
+        post,
+        kind=kind,
+        rule=rule,
+        place=place,
         live=live,
         now=runtime.clock(),
         cap=runtime.rules.jobs_per_hour,
+        bursts=runtime.rules.bursts,
     )
-    if claim == "duplicate":
+    if outcome.claim == "duplicate":
         return
     log_post(
-        "cap_hit" if claim == "cap_hit" else "post",
+        "cap_hit" if outcome.claim == "cap_hit" else "post",
         kind=kind,
         channel=channel,
         sender=sender,
