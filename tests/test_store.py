@@ -4,18 +4,36 @@ import stat
 from pathlib import Path
 
 import pytest
+from helpers import make_post
 
+from mattermost_agent.rules import Bursts, Rule
 from mattermost_agent.store import (
     CAP_WINDOW_SECONDS,
     FILE_NAME,
+    JOB_RETENTION_SECONDS,
+    JOB_STATUSES,
     RETENTION_MS,
-    Claim,
+    Outcome,
+    Pruned,
     Store,
     StoreError,
+    read_job,
+    read_jobs,
 )
 
 NOW = 1_000_000.0
 CAP = 2
+BURSTS = Bursts(quiet_seconds=90, max_wait_seconds=600, max_posts=20)
+INTAKE = Rule(name="intake", scenario="triage", dm=False, channels=frozenset(), senders=frozenset())
+REVIEW = Rule(name="review", scenario="check", dm=False, channels=frozenset(), senders=frozenset())
+SECRET_WORD = "zebraquartz"
+
+# The schema of version 1, as the first release created it.
+SCHEMA_V1 = (
+    "CREATE TABLE handled (post_id TEXT PRIMARY KEY, create_at INTEGER NOT NULL, matched_at REAL)",
+    "CREATE INDEX handled_matched_at ON handled (matched_at) WHERE matched_at IS NOT NULL",
+    "CREATE TABLE last_seen (id INTEGER PRIMARY KEY CHECK (id = 1), create_at INTEGER NOT NULL)",
+)
 
 
 @pytest.fixture
@@ -32,97 +50,263 @@ def claim(
     store: Store,
     post_id: str,
     *,
-    matched: bool = True,
+    rule: Rule | None = INTAKE,
     live: bool = True,
     create_at: int = 1_000,
     now: float = NOW,
-) -> Claim:
-    return store.claim(post_id, create_at, matched=matched, live=live, now=now, cap=CAP)
+    cap: int = CAP,
+    bursts: Bursts = BURSTS,
+    place: str | None = "analytics",
+    **fields: object,
+) -> Outcome:
+    post = make_post(id=post_id, create_at=create_at, **fields)
+    return store.claim(
+        post, kind="channel", rule=rule, place=place, live=live, now=now, cap=cap, bursts=bursts
+    )
 
 
-def row(path: Path, post_id: str) -> tuple[int, float | None] | None:
+def query(path: Path, sql: str, *params: object) -> list[tuple[object, ...]]:
     connection = sqlite3.connect(path)
     try:
-        return connection.execute(
-            "SELECT create_at, matched_at FROM handled WHERE post_id = ?", (post_id,)
-        ).fetchone()
+        return connection.execute(sql, params).fetchall()
     finally:
         connection.close()
 
 
-def test_a_new_post_is_recorded(store: Store, path: Path) -> None:
-    assert claim(store, "a", matched=False) == "unmatched"
-    assert row(path, "a") == (1_000, None)
+def handled(path: Path, post_id: str) -> bool:
+    return bool(query(path, "SELECT 1 FROM handled WHERE post_id = ?", post_id))
 
 
-def test_a_matched_post_is_recorded_with_its_time(store: Store, path: Path) -> None:
-    assert claim(store, "a") == "matched"
-    assert row(path, "a") == (1_000, NOW)
+def jobs(path: Path) -> list[tuple[object, ...]]:
+    """Return (id, status, post_count) per job, oldest first."""
+    return query(path, "SELECT id, status, post_count FROM jobs ORDER BY id")
+
+
+def job_of(path: Path, post_id: str) -> object | None:
+    rows = query(path, "SELECT job_id FROM job_posts WHERE post_id = ?", post_id)
+    return rows[0][0] if rows else None
+
+
+def raw_bytes(path: Path) -> bytes:
+    return b"".join(file.read_bytes() for file in path.parent.iterdir() if file.is_file())
+
+
+def test_an_unmatched_post_is_recorded_without_a_job(store: Store, path: Path) -> None:
+    assert claim(store, "a", rule=None) == Outcome("unmatched")
+    assert handled(path, "a")
+    assert jobs(path) == []
+    assert job_of(path, "a") is None
+
+
+def test_a_matched_post_opens_a_job(store: Store, path: Path) -> None:
+    outcome = claim(store, "a")
+    assert outcome.claim == "opened"
+    assert outcome.closed == ()
+    job = outcome.job
+    assert job is not None
+    assert (job.id, job.status, job.post_count) == (1, "collecting", 1)
+    assert (job.scenario, job.rule, job.place) == ("triage", "intake", "analytics")
+    assert (job.opened_at, job.ready_at, job.deadline_at) == (NOW, NOW + 90, NOW + 600)
+    assert jobs(path) == [(1, "collecting", 1)]
+    assert job_of(path, "a") == 1
+
+
+def test_the_job_keeps_the_posts_text_and_kind(store: Store, path: Path) -> None:
+    claim(store, "a", message=SECRET_WORD)
+    assert query(path, "SELECT kind, message FROM job_posts") == [("channel", SECRET_WORD)]
 
 
 def test_a_duplicate_is_reported(store: Store) -> None:
-    assert claim(store, "a") == "matched"
-    assert claim(store, "a") == "duplicate"
+    assert claim(store, "a").claim == "opened"
+    assert claim(store, "a") == Outcome("duplicate")
 
 
-def test_a_duplicate_does_not_use_the_cap(store: Store) -> None:
-    assert claim(store, "a") == "matched"
-    assert claim(store, "a") == "duplicate"
-    assert claim(store, "a") == "duplicate"
-    assert claim(store, "b") == "matched"
+def test_a_duplicate_neither_joins_nor_uses_the_cap(store: Store, path: Path) -> None:
+    claim(store, "a")
+    claim(store, "a")
+    claim(store, "a")
+    assert jobs(path) == [(1, "collecting", 1)]
+    assert claim(store, "b", channel_id="other").claim == "opened"
 
 
 def test_unmatched_posts_do_not_use_the_cap(store: Store) -> None:
     for number in range(5):
-        assert claim(store, f"plain-{number}", matched=False) == "unmatched"
-    assert claim(store, "a") == "matched"
-    assert claim(store, "b") == "matched"
+        assert claim(store, f"plain-{number}", rule=None).claim == "unmatched"
+    assert claim(store, "a", channel_id="one").claim == "opened"
+    assert claim(store, "b", channel_id="two").claim == "opened"
 
 
-def test_the_cap_is_hit(store: Store) -> None:
-    assert claim(store, "a") == "matched"
-    assert claim(store, "b") == "matched"
-    assert claim(store, "c") == "cap_hit"
+def test_posts_close_together_make_one_job(store: Store, path: Path) -> None:
+    claim(store, "a", now=NOW)
+    second = claim(store, "b", now=NOW + 30)
+    third = claim(store, "c", now=NOW + 60)
+    assert second.claim == third.claim == "joined"
+    assert third.job is not None
+    assert (third.job.id, third.job.status, third.job.post_count) == (1, "collecting", 3)
+    assert jobs(path) == [(1, "collecting", 3)]
+    assert [job_of(path, post_id) for post_id in "abc"] == [1, 1, 1]
 
 
-def test_a_post_over_the_cap_is_not_retried(store: Store, path: Path) -> None:
+def test_each_post_extends_the_quiet_time(store: Store) -> None:
+    claim(store, "a", now=NOW)
+    second = claim(store, "b", now=NOW + 50)
+    assert second.job is not None
+    assert second.job.ready_at == NOW + 50 + 90
+
+
+def test_a_gap_longer_than_the_quiet_time_makes_two_jobs(store: Store, path: Path) -> None:
+    claim(store, "a", now=NOW)
+    outcome = claim(store, "b", now=NOW + 91)
+    assert outcome.claim == "opened"
+    assert outcome.job is not None
+    assert outcome.job.id == 2
+    # The first job was due, and the post made it ready without waiting for the housekeeping.
+    assert [(job.id, job.status) for job in outcome.closed] == [(1, "ready")]
+    assert jobs(path) == [(1, "ready", 1), (2, "collecting", 1)]
+
+
+def test_the_quiet_time_never_passes_the_deadline(store: Store, path: Path) -> None:
+    claim(store, "p0", now=NOW)
+    for number in range(1, 8):
+        late = claim(store, f"p{number}", now=NOW + 80 * number)
+    assert late.claim == "joined"
+    assert late.job is not None
+    assert late.job.ready_at == NOW + 600
+    after = claim(store, "after", now=NOW + 601)
+    assert after.claim == "opened"
+    assert jobs(path) == [(1, "ready", 8), (2, "collecting", 1)]
+
+
+def test_the_job_is_ready_at_max_posts(store: Store, path: Path) -> None:
+    small = Bursts(quiet_seconds=90, max_wait_seconds=600, max_posts=2)
+    claim(store, "a", bursts=small)
+    full = claim(store, "b", bursts=small, now=NOW + 1)
+    assert full.claim == "joined"
+    assert full.job is not None
+    assert full.job.status == "ready"
+    assert full.closed == (full.job,)
+    assert claim(store, "c", bursts=small, now=NOW + 2).job == read_jobs(path)[0]
+    assert jobs(path) == [(1, "ready", 2), (2, "collecting", 1)]
+
+
+def test_max_posts_of_one_makes_every_post_its_own_ready_job(store: Store, path: Path) -> None:
+    single = Bursts(quiet_seconds=90, max_wait_seconds=600, max_posts=1)
+    outcome = claim(store, "a", bursts=single)
+    assert outcome.claim == "opened"
+    assert outcome.job is not None
+    assert outcome.job.status == "ready"
+    assert outcome.closed == (outcome.job,)
+    claim(store, "b", bursts=single)
+    assert jobs(path) == [(1, "ready", 1), (2, "ready", 1)]
+
+
+def test_another_sender_thread_or_channel_opens_another_job(store: Store, path: Path) -> None:
+    claim(store, "a", cap=10)
+    assert claim(store, "b", cap=10, user_id="someone-else").claim == "opened"
+    assert claim(store, "c", cap=10, root_id="thread-1").claim == "opened"
+    assert claim(store, "d", cap=10, channel_id="channel-2").claim == "opened"
+    assert jobs(path) == [(number, "collecting", 1) for number in range(1, 5)]
+
+
+def test_a_reply_and_a_top_level_post_are_different_places(store: Store, path: Path) -> None:
+    claim(store, "a", root_id="thread-1")
+    claim(store, "b", root_id="thread-1")
+    claim(store, "c")
+    assert jobs(path) == [(1, "collecting", 2), (2, "collecting", 1)]
+
+
+def test_another_rule_closes_the_job_and_opens_a_new_one(store: Store, path: Path) -> None:
+    claim(store, "a", rule=INTAKE)
+    outcome = claim(store, "b", rule=REVIEW, now=NOW + 1)
+    assert outcome.claim == "opened"
+    assert [(job.id, job.status, job.rule) for job in outcome.closed] == [(1, "ready", "intake")]
+    assert jobs(path) == [(1, "ready", 1), (2, "collecting", 1)]
+    assert query(path, "SELECT rule, scenario FROM jobs WHERE id = 2") == [("review", "check")]
+
+
+def test_an_unmatched_post_never_joins_a_job(store: Store, path: Path) -> None:
     claim(store, "a")
-    claim(store, "b")
-    assert claim(store, "c") == "cap_hit"
-    assert row(path, "c") == (1_000, None)
-    assert claim(store, "c", now=NOW + CAP_WINDOW_SECONDS + 1) == "duplicate"
+    assert claim(store, "b", rule=None, now=NOW + 1).claim == "unmatched"
+    assert jobs(path) == [(1, "collecting", 1)]
+    assert job_of(path, "b") is None
+
+
+def test_opening_counts_against_the_cap_and_joining_does_not(store: Store, path: Path) -> None:
+    assert claim(store, "a", channel_id="one").claim == "opened"
+    assert claim(store, "b", channel_id="one").claim == "joined"
+    assert claim(store, "c", channel_id="two").claim == "opened"
+    assert claim(store, "d", channel_id="three") == Outcome("cap_hit")
+    assert claim(store, "e", channel_id="one").claim == "joined"
+    assert jobs(path) == [(1, "collecting", 3), (2, "collecting", 1)]
+    assert handled(path, "d")
+    assert job_of(path, "d") is None
+
+
+def test_a_post_over_the_cap_is_not_retried(store: Store) -> None:
+    claim(store, "a", channel_id="one")
+    claim(store, "b", channel_id="two")
+    assert claim(store, "c", channel_id="three").claim == "cap_hit"
+    later = NOW + CAP_WINDOW_SECONDS + 1
+    assert claim(store, "c", channel_id="three", now=later).claim == "duplicate"
+
+
+def test_a_post_over_the_cap_does_not_close_another_rules_job(store: Store, path: Path) -> None:
+    claim(store, "a", rule=INTAKE, channel_id="one")
+    claim(store, "b", channel_id="two")
+    assert claim(store, "c", rule=REVIEW, channel_id="one", now=NOW + 1) == Outcome("cap_hit")
+    assert jobs(path) == [(1, "collecting", 1), (2, "collecting", 1)]
 
 
 def test_catch_up_counts_against_the_cap(store: Store) -> None:
-    assert claim(store, "a", live=False) == "matched"
-    assert claim(store, "b", live=False) == "matched"
-    assert claim(store, "c", live=False) == "cap_hit"
-
-
-def test_posts_over_the_cap_do_not_extend_it(store: Store) -> None:
-    claim(store, "a")
-    claim(store, "b")
-    claim(store, "c")
-    assert claim(store, "d", now=NOW + CAP_WINDOW_SECONDS) == "matched"
+    assert claim(store, "a", live=False, channel_id="one").claim == "opened"
+    assert claim(store, "b", live=False, channel_id="two").claim == "opened"
+    assert claim(store, "c", live=False, channel_id="three").claim == "cap_hit"
 
 
 def test_the_hour_slides(store: Store) -> None:
-    claim(store, "a", now=NOW)
-    claim(store, "b", now=NOW + 1000)
-    assert claim(store, "c", now=NOW + CAP_WINDOW_SECONDS - 1) == "cap_hit"
-    assert claim(store, "d", now=NOW + CAP_WINDOW_SECONDS) == "matched"
-    assert claim(store, "e", now=NOW + CAP_WINDOW_SECONDS + 1) == "cap_hit"
+    claim(store, "a", channel_id="one", now=NOW)
+    claim(store, "b", channel_id="two", now=NOW + 1000)
+    assert claim(store, "c", channel_id="c", now=NOW + CAP_WINDOW_SECONDS - 1).claim == "cap_hit"
+    assert claim(store, "d", channel_id="d", now=NOW + CAP_WINDOW_SECONDS).claim == "opened"
+    assert claim(store, "e", channel_id="e", now=NOW + CAP_WINDOW_SECONDS + 1).claim == "cap_hit"
 
 
 def test_the_cap_survives_a_restart(store: Store, path: Path) -> None:
-    claim(store, "a")
-    claim(store, "b")
-    assert claim(Store(path), "c") == "cap_hit"
+    claim(store, "a", channel_id="one")
+    claim(store, "b", channel_id="two")
+    assert claim(Store(path), "c", channel_id="three").claim == "cap_hit"
 
 
-def test_handled_posts_survive_a_restart(store: Store, path: Path) -> None:
+def test_handled_posts_and_jobs_survive_a_restart(store: Store, path: Path) -> None:
     claim(store, "a")
-    assert claim(Store(path), "a") == "duplicate"
+    reopened = Store(path)
+    assert claim(reopened, "a").claim == "duplicate"
+    assert claim(reopened, "b").claim == "joined"
+
+
+def test_flip_ready_makes_only_due_jobs_ready(store: Store, path: Path) -> None:
+    claim(store, "a", channel_id="one", now=NOW)
+    claim(store, "b", channel_id="two", now=NOW + 10)
+    assert store.flip_ready(NOW + 89) == []
+    flipped = store.flip_ready(NOW + 90)
+    assert [(job.id, job.status, job.post_count) for job in flipped] == [(1, "ready", 1)]
+    assert jobs(path) == [(1, "ready", 1), (2, "collecting", 1)]
+    assert store.flip_ready(NOW + 90) == []
+
+
+def test_a_failure_inside_claim_leaves_nothing_behind(store: Store, path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TRIGGER fail BEFORE INSERT ON job_posts BEGIN SELECT RAISE(ABORT, 'no'); END"
+        )
+    finally:
+        connection.close()
+    with pytest.raises(StoreError, match="cannot use the database"):
+        claim(store, "a")
+    assert not handled(path, "a")
+    assert jobs(path) == []
+    assert store.last_seen() is None
 
 
 def test_no_last_seen_on_the_first_run(store: Store) -> None:
@@ -148,12 +332,12 @@ def test_last_seen_never_goes_back(store: Store) -> None:
 
 def test_a_live_duplicate_still_moves_last_seen(store: Store) -> None:
     claim(store, "a", live=False, create_at=500)
-    assert claim(store, "a", live=True, create_at=500) == "duplicate"
+    assert claim(store, "a", live=True, create_at=500).claim == "duplicate"
     assert store.last_seen() == 500
 
 
 def test_an_unmatched_live_post_moves_last_seen(store: Store) -> None:
-    claim(store, "a", matched=False, create_at=500)
+    claim(store, "a", rule=None, create_at=500)
     assert store.last_seen() == 500
 
 
@@ -170,39 +354,51 @@ def test_last_seen_survives_a_restart(store: Store, path: Path) -> None:
 
 def test_prune_forgets_only_posts_beyond_retention(store: Store, path: Path) -> None:
     latest = RETENTION_MS + 1_000
-    claim(store, "old", matched=False, create_at=999)
-    claim(store, "edge", matched=False, create_at=1_000)
-    claim(store, "new", matched=False, create_at=latest)
-    assert store.prune(NOW) == 1
-    assert row(path, "old") is None
-    assert row(path, "edge") is not None
-    assert row(path, "new") is not None
+    claim(store, "old", rule=None, create_at=999)
+    claim(store, "edge", rule=None, create_at=1_000)
+    claim(store, "new", rule=None, create_at=latest)
+    assert store.prune(NOW) == Pruned(handled=1, jobs=0)
+    assert not handled(path, "old")
+    assert handled(path, "edge")
+    assert handled(path, "new")
 
 
 def test_prune_does_nothing_on_the_first_run(store: Store, path: Path) -> None:
-    claim(store, "a", live=False, matched=False, create_at=1)
-    assert store.prune(NOW) == 0
-    assert row(path, "a") is not None
+    claim(store, "a", live=False, rule=None, create_at=1)
+    assert store.prune(NOW) == Pruned(0, 0)
+    assert handled(path, "a")
 
 
 def test_prune_is_measured_from_last_seen_and_not_from_today(store: Store, path: Path) -> None:
-    claim(store, "a", matched=False, create_at=1_000)
-    assert store.prune(NOW + 10 * RETENTION_MS) == 0
-    assert row(path, "a") is not None
+    claim(store, "a", rule=None, create_at=1_000)
+    assert store.prune(NOW + 10 * RETENTION_MS).handled == 0
+    assert handled(path, "a")
 
 
-def test_prune_keeps_matches_that_still_count_against_the_cap(store: Store) -> None:
-    claim(store, "old", create_at=1)
-    claim(store, "new", create_at=RETENTION_MS + 1_000, now=NOW)
-    assert store.prune(NOW) == 0
-    assert claim(store, "c", create_at=RETENTION_MS + 1_000) == "cap_hit"
+def test_prune_forgets_jobs_after_seven_days_whatever_their_status(
+    store: Store, path: Path
+) -> None:
+    claim(store, "a", channel_id="one", now=NOW)
+    claim(store, "b", channel_id="two", now=NOW + 1)
+    store.flip_ready(NOW + 100)
+    assert store.prune(NOW + JOB_RETENTION_SECONDS).jobs == 0
+    assert store.prune(NOW + JOB_RETENTION_SECONDS + 1).jobs == 1
+    assert jobs(path) == [(2, "ready", 1)]
+    assert job_of(path, "a") is None
+    assert job_of(path, "b") == 2
 
 
-def test_prune_removes_old_matches_after_the_hour(store: Store, path: Path) -> None:
-    claim(store, "old", create_at=1)
-    claim(store, "new", create_at=RETENTION_MS + 1_000)
-    assert store.prune(NOW + CAP_WINDOW_SECONDS) == 1
-    assert row(path, "old") is None
+def test_a_pruned_message_is_gone_from_the_files(store: Store, path: Path) -> None:
+    claim(store, "a", message=f"please check {SECRET_WORD} today")
+    claim(store, "b", rule=None, message=SECRET_WORD, now=NOW + 1)
+    assert raw_bytes(path).count(SECRET_WORD.encode()) == 1
+    store.prune(NOW + JOB_RETENTION_SECONDS + 1)
+    assert raw_bytes(path).count(SECRET_WORD.encode()) == 0
+
+
+def test_an_unmatched_posts_text_never_reaches_the_file(store: Store, path: Path) -> None:
+    claim(store, "a", rule=None, message=SECRET_WORD)
+    assert SECRET_WORD.encode() not in raw_bytes(path)
 
 
 def test_files_are_private(store: Store, path: Path) -> None:
@@ -210,7 +406,18 @@ def test_files_are_private(store: Store, path: Path) -> None:
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
 
-def test_no_column_can_hold_message_text(store: Store, path: Path) -> None:
+def test_the_wal_files_are_private_too(store: Store, path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("SELECT COUNT(*) FROM jobs").fetchone()
+        side_files = [path.with_name(path.name + suffix) for suffix in ("-wal", "-shm")]
+        assert all(file.exists() for file in side_files)
+        assert all(stat.S_IMODE(file.stat().st_mode) == 0o600 for file in side_files)
+    finally:
+        connection.close()
+
+
+def test_text_can_live_only_in_job_posts_message(store: Store, path: Path) -> None:
     connection = sqlite3.connect(path)
     try:
         tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -221,9 +428,38 @@ def test_no_column_can_hold_message_text(store: Store, path: Path) -> None:
     finally:
         connection.close()
     assert columns == {
-        "handled": {"post_id", "create_at", "matched_at"},
+        "handled": {"post_id", "create_at"},
         "last_seen": {"id", "create_at"},
+        "jobs": {
+            "id",
+            "conversation_key",
+            "channel_id",
+            "root_id",
+            "sender_id",
+            "place",
+            "rule",
+            "scenario",
+            "status",
+            "opened_at",
+            "ready_at",
+            "deadline_at",
+            "updated_at",
+            "post_count",
+        },
+        "job_posts": {"post_id", "job_id", "create_at", "kind", "message"},
     }
+
+
+def test_every_planned_status_is_allowed_and_nothing_else(store: Store, path: Path) -> None:
+    claim(store, "a")
+    connection = sqlite3.connect(path)
+    try:
+        for status in JOB_STATUSES:
+            connection.execute("UPDATE jobs SET status = ? WHERE id = 1", (status,))
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE jobs SET status = 'unknown' WHERE id = 1")
+    finally:
+        connection.close()
 
 
 def test_a_read_only_folder_fails_at_startup(tmp_path: Path) -> None:
@@ -261,9 +497,93 @@ def test_an_unknown_schema_version_fails_at_startup(store: Store, path: Path) ->
         Store(path)
 
 
+def version_1_file(path: Path) -> None:
+    path.parent.mkdir()
+    connection = sqlite3.connect(path, isolation_level=None)
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+        for statement in SCHEMA_V1:
+            connection.execute(statement)
+        connection.execute("INSERT INTO handled VALUES ('seen', 1000, NULL), ('hit', 2000, 5.0)")
+        connection.execute("INSERT INTO last_seen VALUES (1, 3000)")
+        connection.execute("PRAGMA user_version = 1")
+    finally:
+        connection.close()
+
+
+def test_a_version_1_file_is_migrated_in_place(path: Path) -> None:
+    version_1_file(path)
+    store = Store(path)
+    assert query(path, "PRAGMA user_version") == [(2,)]
+    assert query(path, "SELECT post_id, create_at FROM handled ORDER BY post_id") == [
+        ("hit", 2000),
+        ("seen", 1000),
+    ]
+    assert [column[1] for column in query(path, "PRAGMA table_info(handled)")] == [
+        "post_id",
+        "create_at",
+    ]
+    assert store.last_seen() == 3000
+    assert claim(store, "seen").claim == "duplicate"
+    assert claim(store, "a").claim == "opened"
+    assert Store(path).last_seen() == 3000
+
+
 def test_a_failure_later_on_raises_store_error(store: Store, path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("root can write anywhere")
     path.chmod(0o400)
     with pytest.raises(StoreError, match="cannot use the database"):
         claim(store, "a")
+
+
+def test_jobs_are_read_newest_first(store: Store, path: Path) -> None:
+    claim(store, "a", channel_id="one")
+    claim(store, "b", channel_id="two", now=NOW + 1)
+    assert [job.id for job in read_jobs(path)] == [2, 1]
+    assert read_jobs(path)[1].post_count == 1
+
+
+def test_a_job_is_read_with_its_posts_in_order(store: Store, path: Path) -> None:
+    claim(store, "late", create_at=3_000, message="three", now=NOW)
+    claim(store, "early", create_at=2_000, message="two", now=NOW + 1)
+    found = read_job(path, 1)
+    assert found is not None
+    job, posts = found
+    assert job.post_count == 2
+    assert [(post.post_id, post.kind, post.message) for post in posts] == [
+        ("early", "channel", "two"),
+        ("late", "channel", "three"),
+    ]
+    assert "two" not in repr(posts[0])
+
+
+def test_an_unknown_job_reads_as_none(store: Store, path: Path) -> None:
+    assert read_job(path, 7) is None
+
+
+def test_jobs_are_read_while_the_listener_holds_the_write_lock(store: Store, path: Path) -> None:
+    claim(store, "a")
+    writer = sqlite3.connect(path, isolation_level=None)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        assert [job.id for job in read_jobs(path)] == [1]
+    finally:
+        writer.close()
+
+
+def test_jobs_are_read_without_the_wal_files(store: Store, path: Path) -> None:
+    claim(store, "a")
+    assert not path.with_name(path.name + "-wal").exists()
+    assert [job.id for job in read_jobs(path)] == [1]
+
+
+def test_reading_a_missing_database_fails_clearly(tmp_path: Path) -> None:
+    with pytest.raises(StoreError, match="cannot use the database"):
+        read_jobs(tmp_path / FILE_NAME)
+
+
+def test_reading_an_old_database_says_to_start_the_listener(path: Path) -> None:
+    version_1_file(path)
+    with pytest.raises(StoreError, match="schema version 1, not 2: start the listener once"):
+        read_jobs(path)

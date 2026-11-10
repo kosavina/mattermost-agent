@@ -16,15 +16,22 @@ from typing import Any
 
 import httpx2
 import pytest
-from helpers import captured_logs, posted_event, raw_post, squeezed
+from helpers import captured_logs, make_post, posted_event, raw_post, squeezed
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 from mattermost_agent import __main__ as entry
 from mattermost_agent import app
 from mattermost_agent.logs import configure_logging
 from mattermost_agent.mattermost import MattermostClient, MattermostError, open_events
-from mattermost_agent.rules import parse_rules
-from mattermost_agent.store import FILE_NAME, RETENTION_MS, Store, StoreError
+from mattermost_agent.rules import Bursts, parse_rules
+from mattermost_agent.store import (
+    FILE_NAME,
+    JOB_RETENTION_SECONDS,
+    RETENTION_MS,
+    Store,
+    StoreError,
+    read_jobs,
+)
 
 TOKEN = "abcdefghijklmnopqrstuvwxyz"
 SECRET_TEXT = "sentinel-private-message"
@@ -33,25 +40,32 @@ NOW_MS = 2_000_000_000_000
 # Later than where a first run sets last-seen, so that these posts count as new.
 LATER = NOW_MS + 10 * 60 * 1000
 
-RULES = """
+BURSTS = Bursts(quiet_seconds=90, max_wait_seconds=600, max_posts=20)
+BURSTS_TEXT = (
+    f"bursts: {{quiet_seconds: {BURSTS.quiet_seconds}, "
+    f"max_wait_seconds: {BURSTS.max_wait_seconds}, max_posts: {BURSTS.max_posts}}}\n"
+)
+RULES = f"""
 rules:
-  - {name: dm-from-anyone, kind: dm, scenario: intake}
-  - {name: mentions-me, kind: mention, scenario: intake}
-  - {name: analytics, channels: [analytics], keywords: [dashboard], scenario: review}
-  - {name: named-sender, from: [example.user], keywords: [urgent], scenario: review}
-limits:
-  matches_per_hour: 20
-"""
+  - {{name: dm-from-anyone, dm: true, scenario: intake}}
+  - {{name: analytics, channels: [analytics], scenario: review}}
+  - {{name: named-sender, channels: [requests], from: [example.user], scenario: review}}
+limits: {{jobs_per_hour: 20}}
+{BURSTS_TEXT}"""
 
 type Scenario = Callable[[], Awaitable[None]]
 
 
 @dataclass
 class Script:
-    """What the fake server does on one connection, after its hello."""
+    """What the fake server does on one connection, after its hello.
+
+    It sends `frames`, runs `after`, sends `more`, then closes or waits for the client to.
+    """
 
     frames: list[str] = field(default_factory=list)
     after: Scenario | None = None
+    more: list[str] = field(default_factory=list)
     close: bool = False
 
 
@@ -117,6 +131,8 @@ class World:
             await connection.send(frame)
         if script.after is not None:
             await script.after()
+        for frame in script.more:
+            await connection.send(frame)
         if script.close:
             await connection.close()
         else:
@@ -226,9 +242,7 @@ def test_a_live_post_is_logged_once(world: World) -> None:
 
 
 def test_a_channel_post_logs_its_channel_name(world: World) -> None:
-    world.scripts = [
-        Script([frame("a", channel_type="O", channel_name="analytics", message="new dashboard")])
-    ]
+    world.scripts = [Script([frame("a", channel_type="O", channel_name="analytics")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'kind=channel channel="analytics"' in world.lines("post")[0]
     assert 'rule="analytics" scenario="review"' in world.lines("post")[0]
@@ -257,7 +271,8 @@ def test_a_mention_is_recognised(world: World) -> None:
     world.scripts = [Script([json.dumps(event)])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'kind=mention channel="random"' in world.lines("post")[0]
-    assert 'rule="mentions-me"' in world.lines("post")[0]
+    # No rule names the channel, and a mention alone is no longer a condition.
+    assert "rule=null" in world.lines("post")[0]
 
 
 def test_my_own_dm_is_logged_with_who_it_went_to(world: World) -> None:
@@ -294,12 +309,12 @@ def test_where_my_own_private_message_went(
 
 
 def test_my_own_post_matches_only_a_rule_that_names_me(world: World) -> None:
-    world.rules_text = """
+    world.rules_text = f"""
 rules:
-  - {name: from-others, kind: dm, scenario: one}
-  - {name: from-me, kind: dm, from: [example.me], scenario: two}
-limits: {matches_per_hour: 5}
-"""
+  - {{name: from-others, dm: true, scenario: one}}
+  - {{name: from-me, dm: true, from: [example.me], scenario: two}}
+limits: {{jobs_per_hour: 5}}
+{BURSTS_TEXT}"""
     world.scripts = [Script([frame("a", user_id="me-id")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'rule="from-me" scenario="two"' in world.lines("post")[0]
@@ -327,6 +342,51 @@ def test_my_own_post_is_found_by_catch_up(world: World) -> None:
     assert 'channel="@example.user" sender="example.me"' in world.lines("post")[1]
 
 
+def test_three_quick_posts_make_one_job(world: World) -> None:
+    posts = [frame(post_id, LATER + n, message=SECRET_TEXT) for n, post_id in enumerate("abc")]
+    world.scripts = [Script(posts)]
+    world.go(lambda: until(lambda: world.handled("c")))
+    jobs = read_jobs(world.store.path)
+    assert [(job.id, job.status, job.post_count) for job in jobs] == [(1, "collecting", 3)]
+    assert len(world.lines("post")) == 3
+    assert len(world.lines("job_opened")) == 1
+    assert len(world.lines("job_joined")) == 2
+    assert (
+        'job=1 status=collecting scenario="intake" rule="dm-from-anyone" place="@example.user" '
+        "posts=3" in world.lines("job_joined")[1]
+    )
+    assert world.lines("job_ready") == []
+    assert SECRET_TEXT not in world.log
+
+
+def test_a_quiet_burst_becomes_ready_and_the_next_post_opens_a_new_job(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app, "HOUSEKEEPING_SECONDS", 0.01)
+
+    def status_of(job_id: int) -> str | None:
+        found = [job for job in read_jobs(world.store.path) if job.id == job_id]
+        return found[0].status if found else None
+
+    async def wait_for_quiet() -> None:
+        await until(lambda: world.handled("c"))
+        world.now += BURSTS.quiet_seconds + 1
+        await until(lambda: status_of(1) == "ready")
+
+    posts = [frame(post_id, LATER + n, message=SECRET_TEXT) for n, post_id in enumerate("abc")]
+    world.scripts = [Script(posts, after=wait_for_quiet, more=[frame("d", LATER + 3)])]
+    world.go(lambda: until(lambda: world.handled("d")))
+    jobs = read_jobs(world.store.path)
+    assert [(job.id, job.status, job.post_count) for job in jobs] == [
+        (2, "collecting", 1),
+        (1, "ready", 3),
+    ]
+    assert len(world.lines("job_ready")) == 1
+    assert "job=1 status=ready" in world.lines("job_ready")[0]
+    assert "job=2 status=collecting" in world.lines("job_opened")[1]
+    assert SECRET_TEXT not in world.log
+
+
 def test_a_system_post_is_skipped(world: World) -> None:
     world.scripts = [Script([frame("s", type="system_join_channel"), frame("b", LATER + 1)])]
     world.go(lambda: until(lambda: world.handled("b")))
@@ -343,9 +403,9 @@ def test_a_post_sent_twice_is_logged_once(world: World) -> None:
 def test_the_sender_is_the_real_user_and_not_the_name_in_the_event(world: World) -> None:
     world.users["webhook-owner"] = "actual.owner"
     event = posted_event(
-        raw_post(id="a", create_at=LATER, user_id="webhook-owner", message="urgent"),
+        raw_post(id="a", create_at=LATER, user_id="webhook-owner"),
         channel_type="O",
-        channel_name="random",
+        channel_name="requests",
         sender_name="@example.user",
     )
     world.scripts = [Script([json.dumps(event)])]
@@ -355,24 +415,26 @@ def test_the_sender_is_the_real_user_and_not_the_name_in_the_event(world: World)
 
 
 def test_the_first_matching_rule_wins_in_the_loop(world: World) -> None:
-    world.rules_text = """
+    world.rules_text = f"""
 rules:
-  - {name: first, kind: dm, scenario: one}
-  - {name: second, kind: dm, scenario: two}
-limits: {matches_per_hour: 5}
-"""
+  - {{name: first, dm: true, scenario: one}}
+  - {{name: second, dm: true, scenario: two}}
+limits: {{jobs_per_hour: 5}}
+{BURSTS_TEXT}"""
     world.scripts = [Script([frame("a")])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'rule="first" scenario="one"' in world.lines("post")[0]
 
 
 def test_a_match_over_the_cap_is_logged_as_cap_hit(world: World) -> None:
-    world.rules_text = """
+    world.rules_text = f"""
 rules:
-  - {name: dm, kind: dm, scenario: intake}
-limits: {matches_per_hour: 1}
-"""
-    world.scripts = [Script([frame("a"), frame("b", LATER + 1)])]
+  - {{name: dm, dm: true, scenario: intake}}
+limits: {{jobs_per_hour: 1}}
+{BURSTS_TEXT}"""
+    # A second post in the same DM would join the first job; another DM needs a job of its own.
+    other_dm = frame("b", LATER + 1, channel_name="me-id__third-id", channel_id="channel-2")
+    world.scripts = [Script([frame("a"), other_dm])]
     world.go(lambda: until(lambda: world.handled("b")))
     assert len(world.lines("post")) == 1
     assert len(world.lines("cap_hit")) == 1
@@ -698,7 +760,7 @@ def test_nothing_secret_reaches_the_log_even_at_debug(world: World) -> None:
 
 
 def test_the_heartbeat_file_is_refreshed(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(app, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(app, "HOUSEKEEPING_SECONDS", 0.01)
     path = world.tmp_path / "state" / app.HEARTBEAT_FILE
 
     async def scenario() -> None:
@@ -712,7 +774,7 @@ def test_the_heartbeat_file_is_refreshed(world: World, monkeypatch: pytest.Monke
 def test_the_heartbeat_continues_during_an_outage(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(app, "HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(app, "HOUSEKEEPING_SECONDS", 0.01)
     world.connect_failures = [MattermostError("unreachable") for _ in range(10_000)]
     path = world.tmp_path / "state" / app.HEARTBEAT_FILE
 
@@ -740,8 +802,23 @@ def test_a_heartbeat_that_cannot_be_written_stops_the_app(world: World) -> None:
 def test_old_posts_are_pruned_at_startup(world: World) -> None:
     world.store.set_first_last_seen(NOW_MS)
     old = NOW_MS - RETENTION_MS - 1
-    world.store.claim("ancient", old, matched=False, live=False, now=NOW - 7200, cap=20)
+    ancient = make_post(id="ancient", create_at=old)
+    world.store.claim(
+        ancient, kind="dm", rule=None, place=None, live=False, now=NOW - 7200, cap=20, bursts=BURSTS
+    )
     world.go(lambda: until(lambda: not world.handled("ancient")))
+
+
+def test_old_jobs_are_pruned_at_startup(world: World) -> None:
+    old = make_post(id="old", create_at=NOW_MS - 1000, message=SECRET_TEXT)
+    rule = parse_rules(RULES).rules[1]
+    opened = NOW - JOB_RETENTION_SECONDS - 1
+    world.store.claim(
+        old, kind="channel", rule=rule, place=None, live=False, now=opened, cap=20, bursts=BURSTS
+    )
+    world.go(lambda: until(lambda: read_jobs(world.store.path) == []))
+    assert "count=1" in world.lines("jobs_pruned")[0]
+    assert SECRET_TEXT not in world.log
 
 
 def test_healthcheck_passes_on_a_fresh_file(tmp_path: Path) -> None:
