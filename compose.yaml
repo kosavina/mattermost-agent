@@ -15,7 +15,7 @@ services:
     read_only: true
     tmpfs: [/tmp]
     volumes:
-      - agent_data:/data        # handled posts and last-seen: keep this volume
+      - agent_data:/data        # the jobs with their text, handled posts, last-seen: keep it
       # The long form, because the short one would create a folder if the file were missing.
       - type: bind
         source: ./rules.yaml
