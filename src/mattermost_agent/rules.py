@@ -20,13 +20,6 @@ LIMIT_KEYS = frozenset({"jobs_per_hour"})
 BURST_KEYS = ("quiet_seconds", "max_wait_seconds", "max_posts")
 RULE_KEYS = frozenset({"name", "scenario", "dm", "channels", "from"})
 CONDITION_KEYS = frozenset({"dm", "channels", "from"})
-# Keys of the first format. The error names them, because "unknown key" alone would not tell a
-# reader that the format changed. These are fixed words, never a piece of the file.
-REMOVED_KEYS = {
-    "kind": "use dm: true or channels",
-    "keywords": "match on dm, channels and from instead",
-    "matches_per_hour": "use jobs_per_hour",
-}
 
 CHANNEL_NAME = re.compile(r"[a-z0-9_-]+", re.IGNORECASE)
 USERNAME = re.compile(r"[a-z0-9._-]+", re.IGNORECASE)
@@ -98,9 +91,6 @@ def _parse_yaml(text: str) -> object:
 def _mapping(value: object, where: str, allowed: frozenset[str]) -> dict[str, object]:
     if not isinstance(value, dict):
         raise RulesError(f"{where} must be a mapping")
-    for key in value:
-        if key in REMOVED_KEYS:
-            raise RulesError(f"{where} uses {key}, which was removed: {REMOVED_KEYS[key]}")
     unknown = [key for key in value if key not in allowed]
     if unknown:
         raise RulesError(f"{where} has an unknown key; allowed: {', '.join(sorted(allowed))}")

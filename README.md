@@ -1,8 +1,8 @@
 # mattermost-agent
 
-A listener for your Mattermost account. It watches for new posts, checks each one against your rules, groups matching posts into bursts, and queues each burst as a job for the agent that will come next.
+A listener for your Mattermost account. It watches for new posts, checks each one against your rules, groups matching posts into bursts, and queues each burst as a job.
 
-This is a dry run, the second milestone of a personal agent.
+This is the reading half of a personal agent, running as a dry run: it reads and queues, and the processor that will act on the jobs does not exist yet.
 
 **What it does**
 
@@ -10,7 +10,7 @@ This is a dry run, the second milestone of a personal agent.
 - After each reconnect, fetches the posts it missed in your direct messages and in the channels your rules name.
 - Applies the first rule that matches a post. A rule matches on where the post is (a direct message, a channel) and who wrote it.
 - Includes the posts you send. A rule applies to those only if its `from` list names you.
-- Groups matching posts from one sender, in one place, written close together, into one **job**, and keeps them with their text until the next milestone's processor picks them up.
+- Groups matching posts from one sender, in one place, written close together, into one **job**, and keeps them with their text for the processor.
 - Logs one line per post and per change to a job, without the message text.
 - Shows the queue on request: `mattermost-agent jobs`.
 
@@ -105,11 +105,11 @@ bursts:
 
 The three burst settings are whole numbers of at least 1, and `quiet_seconds` may not be larger than `max_wait_seconds`.
 
-**Upgrading from the first format.** The `kind` and `keywords` conditions and the `matches_per_hour` limit are gone, and a file that still uses them stops the listener at startup with a message naming the key. Replace `kind: dm` with `dm: true`, `kind: mention` and other kinds with `channels`, drop `keywords`, and rename the limit to `jobs_per_hour`. Being @mentioned is no longer a condition on purpose: an @mention in a channel no rule names does not open a job.
+Being @mentioned is not a condition: an @mention in a channel no rule names does not open a job. Neither is the text of a post. The listener refuses a file it cannot fully understand (an unknown key, a condition of the wrong type, a missing section) with one line naming the rule number, so a typo cannot silently widen a rule.
 
 ## Bursts and jobs
 
-People write a request as several short messages. A **burst** is the matching posts of one sender, in one place, written close together, and each burst becomes one **job**. One place means the same channel and the same thread: a reply in a thread and a top-level post in the same channel belong to different jobs.
+People write a request as several short messages. A **burst** is the matching posts of one sender, in one place, written close together, and each burst becomes one **job**, the unit the processor will work on. One place means the same channel and the same thread: a reply in a thread and a top-level post in the same channel belong to different jobs.
 
 - The first matching post opens a job, in status `collecting`. Each further post from the same sender in the same place joins it, as long as the same rule matched.
 - The job becomes `ready` after `quiet_seconds` without a new post, or `max_wait_seconds` after its first post, or when it holds `max_posts` posts, whichever comes first. A post that arrives later opens a new job.
@@ -117,7 +117,7 @@ People write a request as several short messages. A **burst** is the matching po
 - Timing uses the listener's clock when it handles the post, so posts fetched during catch-up are grouped as well.
 - A job and its posts are deleted 7 days after the job opened, whatever its status. The text is overwritten in the database file at that point.
 
-Later milestones add the statuses `running`, `waiting_approval`, `done` and `failed`.
+The processor will move a job on through `running`, `waiting_approval`, `done` and `failed`; the listener never touches a job after `ready`.
 
 **Where the state lives.** The database and the heartbeat are in the Docker volume `agent_data`. If you set `STATE_DIR` yourself, point it at a local disk, never at a network share or a VM shared folder (such as `/Volumes/My Shared Files` on a Mac): the listener and the `jobs` command share one SQLite file in WAL mode, which needs a local file system.
 
@@ -141,7 +141,7 @@ event=post kind=dm channel=null sender="example.user" length=42 rule="dm-from-an
 | Field | Meaning |
 | --- | --- |
 | `event` | `post`, or `cap_hit` if the post matched a rule but the hourly limit was already reached |
-| `kind` | `dm`, `group_dm`, `mention`, `thread_reply` or `channel`. Kept for information; rules do not use it |
+| `kind` | `dm`, `group_dm`, `mention`, `thread_reply` or `channel`. Rules do not use it; it is kept with the post for the processor |
 | `channel` | The channel's URL name. For a direct message you sent, `@` and the recipient's username. Otherwise `null` for direct and group messages |
 | `sender` | The sender's username, or `null` if it could not be looked up |
 | `length` | Number of characters in the post. This is the only thing logged about its text |
@@ -192,7 +192,7 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 - **Missed posts.** Catch-up covers direct messages and channels named in your rules. A post that a `from` rule would match in any other channel, while the listener is disconnected, is not seen.
 - **Edited and deleted posts.** A job keeps a post's text as it was when the post arrived. A later edit is not seen, and a post deleted later stays in its job.
 - **Posts without a sender.** After `lookup_failed` the post is logged with `sender=null`, and a rule with `from` cannot match it. It is not tried again.
-- **Mentions.** Being @mentioned is logged as `kind=mention` but is not a condition. Catch-up recognises only a literal `@yourname` for that.
+- **Mentions.** Being @mentioned is recorded as `kind=mention` but is not a condition. Catch-up recognises only a literal `@yourname` for that.
 - **First run.** It starts from now and does not read old posts.
 - **Long outages.** Catch-up goes back at most 30 days.
 - **Rules** are read at startup, so a change needs a restart.

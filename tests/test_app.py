@@ -271,7 +271,7 @@ def test_a_mention_is_recognised(world: World) -> None:
     world.scripts = [Script([json.dumps(event)])]
     world.go(lambda: until(lambda: world.handled("a")))
     assert 'kind=mention channel="random"' in world.lines("post")[0]
-    # No rule names the channel, and a mention alone is no longer a condition.
+    # Being mentioned is not a condition, and no rule names the channel.
     assert "rule=null" in world.lines("post")[0]
 
 

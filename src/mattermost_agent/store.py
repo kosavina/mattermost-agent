@@ -31,9 +31,8 @@ CAP_WINDOW_SECONDS = 3600
 type JobStatus = Literal["collecting", "ready", "running", "waiting_approval", "done", "failed"]
 JOB_STATUSES: tuple[str, ...] = get_args(JobStatus.__value__)
 
-# Version 1 had handled.matched_at, which counted matches against the cap. The cap now counts
-# jobs, so the migration drops the column, and a new file never gets it.
-TABLES_V1 = (
+# The statuses after `ready` belong to the processor, which will set them.
+SCHEMA = (
     """
     CREATE TABLE handled (
         post_id TEXT PRIMARY KEY,
@@ -46,9 +45,6 @@ TABLES_V1 = (
         create_at INTEGER NOT NULL
     )
     """,
-)
-# The statuses after `ready` are for the processor of milestone 3, so that it needs no migration.
-TABLES_V2 = (
     """
     CREATE TABLE jobs (
         id INTEGER PRIMARY KEY,
@@ -83,11 +79,6 @@ TABLES_V2 = (
     )
     """,
     "CREATE INDEX job_posts_job_id ON job_posts (job_id, create_at)",
-)
-MIGRATE_1_TO_2 = (
-    "DROP INDEX handled_matched_at",
-    "ALTER TABLE handled DROP COLUMN matched_at",
-    *TABLES_V2,
 )
 JOB_COLUMNS = "id, status, scenario, rule, place, post_count, opened_at, ready_at, deadline_at"
 
@@ -158,7 +149,7 @@ def _add_post(connection: sqlite3.Connection, job_id: int, post: Post, kind: Kin
 
 
 class Store:
-    """Open the database, creating or migrating it if needed, or raise StoreError to fail fast."""
+    """Open the database, creating it if needed, or raise StoreError so startup can fail fast."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -213,16 +204,11 @@ class Store:
         with self._transaction() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
-                statements = TABLES_V1 + TABLES_V2
-            elif version == 1:
-                statements = MIGRATE_1_TO_2
-            elif version == SCHEMA_VERSION:
-                return
-            else:
+                for statement in SCHEMA:
+                    connection.execute(statement)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            elif version != SCHEMA_VERSION:
                 raise sqlite3.DatabaseError(f"unknown schema version {version}")
-            for statement in statements:
-                connection.execute(statement)
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def claim(
         self,
@@ -248,7 +234,7 @@ class Store:
         the old job is made ready here, without waiting for the housekeeping loop, and the post
         opens a new one. The partial unique index allows one collecting job per key.
 
-        TODO(milestone 3): an edit or a deletion after the post arrived is not seen. The text
+        TODO(processor): an edit or a deletion after the post arrived is not seen. The text
         stays as it was, and a deleted post stays in its job.
         """
         with self._transaction() as connection:
@@ -402,10 +388,7 @@ def _read_only(path: Path) -> Generator[sqlite3.Connection]:
             connection.execute("PRAGMA busy_timeout = 5000")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
-                raise StoreError(
-                    f"the database {path} has schema version {version}, not {SCHEMA_VERSION}: "
-                    "start the listener once to migrate it"
-                )
+                raise sqlite3.DatabaseError(f"unknown schema version {version}")
             yield connection
         finally:
             connection.close()

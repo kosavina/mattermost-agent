@@ -1,6 +1,6 @@
 """The only code that talks to the Mattermost server.
 
-Every REST call here is a GET, and the WebSocket is only ever read from, so this milestone has no
+Every REST call here is a GET, and the WebSocket is only ever read from, so the listener has no
 way to post. The token goes only to the configured server: redirects are refused on both paths,
 because following one could carry the token to another host, and proxy settings in the
 environment are ignored.
