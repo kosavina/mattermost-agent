@@ -1,13 +1,16 @@
-"""Start the listener, or with `healthcheck`, report whether a running one is alive.
+"""Start the listener; with `healthcheck`, report whether a running one is alive; with `jobs`,
+show the queue.
 
 Errors are shown as one line. A traceback could quote the data that caused it.
 """
 
 import asyncio
 import os
+import re
 import sys
 
 from mattermost_agent.app import HEARTBEAT_FILE, Runtime, healthcheck, serve
+from mattermost_agent.jobs import show_jobs
 from mattermost_agent.logs import configure_logging, log_lifecycle
 from mattermost_agent.mattermost import (
     MattermostClient,
@@ -19,13 +22,20 @@ from mattermost_agent.rules import RulesError, load_rules
 from mattermost_agent.settings import SettingsError, load_settings
 from mattermost_agent.store import FILE_NAME, Store, StoreError
 
+USAGE = "usage: mattermost-agent [healthcheck | jobs [id]]"
+JOB_ID = re.compile(r"[0-9]{1,18}")
+
 
 def main() -> None:
     arguments = sys.argv[1:]
     if arguments == ["healthcheck"]:
         sys.exit(healthcheck(os.environ))
+    if arguments == ["jobs"]:
+        sys.exit(show_jobs(os.environ, None))
+    if len(arguments) == 2 and arguments[0] == "jobs" and JOB_ID.fullmatch(arguments[1]):
+        sys.exit(show_jobs(os.environ, int(arguments[1])))
     if arguments:
-        raise SystemExit("usage: mattermost-agent [healthcheck]")
+        raise SystemExit(USAGE)
 
     try:
         settings = load_settings(os.environ)
