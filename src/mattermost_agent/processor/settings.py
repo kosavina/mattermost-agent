@@ -164,11 +164,10 @@ def load_processor_settings(env: Mapping[str, str]) -> ProcessorSettings:
     state_dir = _local_path(env, "STATE_DIR")
     agent_root = _local_path(env, "AGENT_ROOT")
     roots = _roots(agent_root)
+    # Resolved in both cases: the default could be a symlink to a shared volume or into a root.
     codex_home = (
-        Path(env["CODEX_HOME"]).expanduser().resolve()
-        if env.get("CODEX_HOME")
-        else agent_root / "codex-home"
-    )
+        Path(env["CODEX_HOME"]).expanduser() if env.get("CODEX_HOME") else agent_root / "codex-home"
+    ).resolve()
     if inside(codex_home, SHARED_VOLUMES):
         raise SettingsError("CODEX_HOME is on a shared volume; it must be on the local disk")
     for name, folder in (("STATE_DIR", state_dir), ("CODEX_HOME", codex_home)):
