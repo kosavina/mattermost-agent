@@ -337,6 +337,16 @@ def test_a_crash_before_the_first_checkpoint_starts_the_job_afresh(world: World)
     assert len(world.fake.tasks) == 1
 
 
+def test_a_job_finished_since_the_sweep_listed_it_is_not_started_afresh(world: World) -> None:
+    """The approve command finished the job and deleted its thread after resume_running saw it."""
+    job = world.job()
+    world.store.set_done(job.id, now=NOW, approval="approved")
+    world.fake.answers = [answer("ignore")]
+    Processor(world.runtime, poll_s=0.01).run_job(job.id, resume=True)
+    assert world.jobs() == [(job.id, "done", None, None, "approved")]
+    assert world.fake.tasks == []
+
+
 def test_a_stop_signal_during_a_run_leaves_the_job_running(world: World) -> None:
     """The signal handler raises Stop inside the agent run; the loop must end, not fail the job."""
     job = world.job()

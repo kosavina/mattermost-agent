@@ -88,10 +88,14 @@ class Processor:
         """Invoke the graph for one job (from the start, or continuing after a crash) and record.
 
         A job taken by a processor that died before its first checkpoint has no thread to
-        continue: it is started from the beginning.
+        continue: it is started from the beginning, if it is still `running` (the approve command
+        may have finished it, and deleted its thread, since the sweep listed it).
         """
         store, now = self.runtime.store, self.runtime.clock
         if resume and self.runtime.checkpointer.get_tuple(thread(job_id)) is None:
+            job = store.job(job_id)
+            if job is None or job.status != "running":
+                return
             resume = False
         try:
             result = self.graph.invoke(None if resume else {"job_id": job_id}, thread(job_id))
