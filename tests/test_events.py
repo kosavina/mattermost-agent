@@ -284,9 +284,23 @@ def test_draft_listing() -> None:
         ChatDraft("c", "root-1", ""),
         ChatDraft("d", "", ""),
     ]
+    assert [draft.is_empty for draft in drafts] == [False, True, True]
     assert SECRET not in repr(drafts)
     assert parse_drafts([]) == []
     assert parse_drafts(None) == []  # what the real server sends for "no drafts"
+
+
+@pytest.mark.parametrize("file_ids", [["file-1"], "file-1", {}, 0])
+def test_a_draft_with_attachments_is_not_empty(file_ids: object) -> None:
+    """Text or not. Anything but "no files" counts, so that a draft is protected when in doubt."""
+    (draft,) = parse_drafts([{"channel_id": "c", "message": " ", "file_ids": file_ids}])
+    assert draft.has_files and not draft.is_empty
+
+
+@pytest.mark.parametrize("file_ids", [[], None])
+def test_a_draft_without_files_or_text_is_empty(file_ids: object) -> None:
+    (draft,) = parse_drafts([{"channel_id": "c", "message": "\n", "file_ids": file_ids}])
+    assert not draft.has_files and draft.is_empty
 
 
 @pytest.mark.parametrize(

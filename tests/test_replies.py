@@ -33,7 +33,9 @@ def first(kind: str = "dm", post_id: str = "first-post") -> JobPost:
     [
         ("Yes, the filter is right.", False, None),
         ("Thanks @ivan, it is fixed.", False, None),
-        ("@Ivan. Done", False, None),
+        ("@Ivan, done", False, None),
+        ("(cc @ivan)", False, None),
+        ("@ivan", False, None),
         ("x" * MAX_SEND_CHARS, False, None),
         ("Fine, but please check.", True, "needs_review"),
         ("x" * (MAX_SEND_CHARS + 1), False, "length"),
@@ -45,12 +47,44 @@ def first(kind: str = "dm", post_id: str = "first-post") -> JobPost:
         ("Ask @ivan.petrov about it", False, "mention"),
         ("write to ivan@example.com", False, "mention"),
         ("ask @Пётр", False, "mention"),
+        # Only exactly the sender's name: nothing is taken off the end, nothing may follow it.
+        ("Thanks @ivan.", False, "mention"),
+        ("@ivan_ ok", False, "mention"),
+        ("@ivan\u043e\u0432", False, "mention"),  # Cyrillic letters right after the name
+        ("@ivan@channel", False, "mention"),
+        ("meet @ 5 pm", False, "mention"),
+        # One @ must not hide the next one (found by the security review).
+        ("Done.@.@channel", False, "mention"),
+        ("Thanks.@ivan.@channel", False, "mention"),
+        ("x.@.@petr", False, "mention"),
+        ("ok-@-@all", False, "mention"),
+        ("@\u202achannel", False, "mention"),
         ("See http://example.com", False, "link"),
         ("See HTTPS://example.com", False, "link"),
         ("See ftp://example.com/file", False, "link"),
         ("See www.example.com", False, "link"),
         ("See [the docs](docs)", False, "link"),
         ("![chart](chart.png)", False, "link"),
+        # Links by reference and autolinks need no scheme (found by the security review).
+        ("See [the access form][1]\n\n[1]: evil.example/login", False, "link"),
+        ("[evil.example]\n\n[evil.example]: //evil.example/x", False, "link"),
+        ("<http:/evil.example/x>", False, "link"),
+        ("see //evil.example/x", False, "link"),
+        ("http:\u202a//evil.example", False, "link"),
+        # What could make Mattermost read the text differently than the checks do.
+        ("&#64;channel", False, "markup"),
+        ("&commat;all", False, "markup"),
+        ("&#x40;here", False, "markup"),
+        ("a \\@channel escape", False, "mention"),
+        ("an escaped \\* star", False, "markup"),
+        ("```\ncode that would swallow the label", False, "markup"),
+        ("~~~\ncode", False, "markup"),
+        ("zero\u200bwidth", False, "markup"),
+        ("right\u202eto left", False, "markup"),
+        ("a bell \x07", False, "markup"),
+        ("carriage\rreturn", False, "markup"),
+        ("Line one.\nLine two, with a\ttab, R&D and 50% & more.", False, None),
+        ("Привет! Да, фильтр верный: 10-12 мая.", False, None),
         # The first check that fires is the one recorded.
         ("@channel " + "x" * MAX_SEND_CHARS, False, "length"),
         ("@petr see http://example.com", False, "mention"),
@@ -67,9 +101,11 @@ def test_a_send_reply_is_downgraded_by_the_first_check_that_fires(
     assert not plan.refused
 
 
-def test_a_lone_at_sign_is_not_a_mention() -> None:
-    assert content_downgrade("meet @ 5 pm, cost 3 @ 10", "ivan") is None
-    assert content_downgrade("the end @", "ivan") is None
+def test_every_at_sign_is_looked_at_by_itself() -> None:
+    assert content_downgrade("@ivan and again @ivan", "ivan") is None
+    assert content_downgrade("@ivan and then @petr", "ivan") == "mention"
+    assert content_downgrade("the end @", "ivan") == "mention"
+    assert content_downgrade("no sender is known @", "") == "mention"
 
 
 def test_without_a_known_sender_every_mention_downgrades() -> None:
@@ -79,7 +115,9 @@ def test_without_a_known_sender_every_mention_downgrades() -> None:
 
 
 @pytest.mark.parametrize("mode", ["draft", "send"])
-@pytest.mark.parametrize("draft", ["/away", "  /leave", "\n/kick @ivan", "/"])
+@pytest.mark.parametrize(
+    "draft", ["/away", "  /leave", "\n/kick @ivan", "/", "\ufeff/leave", "\u200b \n\u2060/away"]
+)
 def test_a_slash_command_is_refused_in_every_mode(mode: DeliveryMode, draft: str) -> None:
     plan = plan_reply(mode, job(), first(), draft, needs_review=False)
     assert plan.refused and plan.mode == "draft" and plan.downgrade is None
@@ -89,6 +127,7 @@ def test_a_slash_command_is_refused_in_every_mode(mode: DeliveryMode, draft: str
 
 def test_a_slash_inside_the_text_is_not_a_command() -> None:
     assert not is_command("either/or, and 1/2")
+    assert not is_command("") and not is_command(" \u200b\n")
     plan = plan_reply("send", job(), first(), "either/or", needs_review=False)
     assert plan.mode == "send" and not plan.refused
 

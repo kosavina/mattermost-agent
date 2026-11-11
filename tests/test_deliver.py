@@ -411,6 +411,18 @@ def test_an_empty_draft_does_not_block(world: World, message: str) -> None:
     assert world.what(job)[2] == "drafted"
 
 
+@pytest.mark.parametrize("message", ["", "Yes, the filter is right."])
+def test_a_draft_that_holds_attachments_is_never_overwritten(world: World, message: str) -> None:
+    """Even with no text, and even with the very text of the reply."""
+    world.server.drafts.append(
+        {"channel_id": DM, "root_id": "", "message": message, "file_ids": ["a-file-kirill-added"]}
+    )
+    job = world.queue("Yes, the filter is right.")
+    world.once()
+    assert world.what(job) == ("draft", "pending", None, None, "draft_busy")
+    assert world.server.sent("POST", "/drafts") == []
+
+
 def test_a_draft_elsewhere_does_not_block(world: World) -> None:
     world.server.draft(DM, "a draft in a thread of this chat", root_id="some-thread")
     world.server.draft(TOWN, "a draft in another chat")
@@ -680,6 +692,9 @@ def test_a_rule_that_is_no_longer_send_in_the_listeners_rules_is_not_obeyed(worl
         ("See https://example.com/docs", "link"),
         ("Ask @petr about it", "mention"),
         ("Hello @channel", "mention"),
+        ("Done.@.@channel", "mention"),
+        ("See [the form][1]\n\n[1]: evil.example/login", "link"),
+        ("&#64;channel", "markup"),
         ("x" * 1501, "length"),
     ],
 )

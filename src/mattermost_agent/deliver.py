@@ -237,11 +237,11 @@ class Deliverer:
         for team_id in teams:
             for draft in await self.writer.list_drafts(me.user_id, team_id):
                 same_place = (draft.channel_id, draft.root_id) == (row.channel_id, row.root_id)
-                if same_place and draft.message.strip():
+                if same_place and not draft.is_empty:
                     existing = draft
             if existing is not None:
                 break
-        if existing is not None and existing.message != text:
+        if existing is not None and (existing.message != text or existing.has_files):
             self._wait(runtime, reply, "draft_busy", None, BUSY_RETRY_SECONDS)
             return
         if existing is None:

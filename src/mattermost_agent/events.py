@@ -53,11 +53,19 @@ class Channel:
 
 @dataclass(frozen=True)
 class ChatDraft:
-    """A draft in a message box, as the server lists it. repr() leaves out the text."""
+    """A draft in a message box, as the server lists it. repr() leaves out the text.
+
+    `has_files` is for a draft that holds attachments, perhaps with no text at all.
+    """
 
     channel_id: str
     root_id: str
     message: str = field(repr=False)
+    has_files: bool = False
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.message.strip() and not self.has_files
 
 
 @dataclass(frozen=True)
@@ -255,6 +263,8 @@ def parse_drafts(body: object) -> list[ChatDraft]:
                 channel_id=_text(draft, "channel_id"),
                 root_id=_text(draft, "root_id", ""),
                 message=_text(draft, "message", ""),
+                # Anything but "no files" counts as files: a draft is protected when in doubt.
+                has_files=draft.get("file_ids") not in (None, []),
             )
         )
     return drafts

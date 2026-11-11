@@ -305,7 +305,7 @@ event=job_done   job=12 status=waiting_approval fail_reason=null
 | `agent_run` | One agent run finished with `decision`. `denials` is how many tool calls the agent's own controls refused (Claude reports them; Codex cannot) |
 | `agent_error` | A run failed: `exit` (non-zero exit code), `timeout`, `invalid_json` or `invalid_output` (an answer that does not fit the schema), `denied_startup`. It is tried again up to three times |
 | `memory_saved` | The conversation's memory was replaced; `chars` is its length and `version` its number |
-| `reply_planned` | A reply went to the outbox. `mode` is `draft` or `send`; `downgrade` names the check that turned a `send` into a draft (`needs_review`, `length`, `mention`, `link`); `outcome` is `queued`, or `refused_command` for a reply that starts with `/`; `chars` is its length |
+| `reply_planned` | A reply went to the outbox. `mode` is `draft` or `send`; `downgrade` names the check that turned a `send` into a draft (`needs_review`, `length`, `mention`, `link`, `markup`); `outcome` is `queued`, or `refused_command` for a reply that starts with `/`; `chars` is its length |
 | `job_done` | The job left the processor: `status` is `waiting_approval`, `done` or `failed`, and `fail_reason` one of `agent_failed`, `agent_timeout`, `invalid_output`, `unknown_scenario`, `unknown_rule`, `bad_folder`, `expired` |
 
 `LOG_LEVEL` in `.env` sets the level: `DEBUG`, `INFO`, `WARNING` or `ERROR`. The default is `INFO`.
