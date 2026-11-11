@@ -12,10 +12,10 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 WORKDIR /app
 # Dependencies first: this layer is cached and rebuilt only when uv.lock or pyproject.toml change.
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN uv sync --locked --no-default-groups --no-install-project
 # Then the app itself, as a regular (non-editable) install, so the venv needs no src/.
 COPY src ./src
-RUN uv sync --locked --no-dev --no-editable
+RUN uv sync --locked --no-default-groups --no-editable
 
 # Final stage: the same Python base (the venv points at its interpreter), the venv, and a
 # non-root user. Nothing else.
