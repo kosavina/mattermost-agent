@@ -125,13 +125,13 @@ The processor will move a job on through `running`, `waiting_approval`, `done` a
 
 ## Processor
 
-The processor is a second process next to the listener. In this version both run natively on a Mac (`uv run`), sharing the state folder; the Docker image is the listener only, and the processor's packages are not in it.
+The processor is a second process next to the listener. In this version both run natively on a Mac (`uv run`), sharing the state folder; the Docker image is the listener only, and the processor's packages are not in it. Only one processor may run per state folder: it holds `state/processor.lock` for its whole run, and a second `process` command exits at once.
 
 **Folders.** Everything lives under one agent root, `~/agent`, on the local disk (never under `/Volumes`, where neither SQLite nor Codex's sandbox work):
 
 ```text
 ~/agent/                 mode 700
-  state/                 STATE_DIR: the listener's state.sqlite3 and the processor's checkpoints.sqlite3
+  state/                 STATE_DIR: the listener's state.sqlite3, the processor's checkpoints.sqlite3 and processor.lock
   scenarios/             your scenario folders (trusted instructions) and scenarios.yaml
     scenarios.yaml
     intake/AGENTS.md

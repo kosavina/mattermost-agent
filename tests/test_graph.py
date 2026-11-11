@@ -20,11 +20,12 @@ from mattermost_agent.processor.checkpoints import (
 )
 from mattermost_agent.processor.cli import decide_draft, format_drafts
 from mattermost_agent.processor.graph import ProcessorRuntime
-from mattermost_agent.processor.loop import Processor, Stop
+from mattermost_agent.processor.loop import LOCK_FILE, Processor, Stop, hold_lock, release_lock
 from mattermost_agent.processor.memory import memory_versions, read_memory
 from mattermost_agent.processor.scenarios import Scenario
 from mattermost_agent.processor.settings import Roots
 from mattermost_agent.rules import Bursts, Rule, RuleSet
+from mattermost_agent.settings import SettingsError
 from mattermost_agent.store import (
     DRAFT_RETENTION_SECONDS,
     FILE_NAME,
@@ -85,7 +86,8 @@ class World:
     def clock(self) -> float:
         return self.now
 
-    def job(self, message: str = POST_CANARY, post_id: str = "a") -> Job:
+    def job(self, message: str = POST_CANARY, post_id: str = "a", take: bool = True) -> Job:
+        """Claim a job as the listener would and, unless `take` is off, take it like the loop."""
         post = make_post(id=post_id, channel_id=CHANNEL, message=message)
         outcome = self.store.claim(
             post,
@@ -99,6 +101,10 @@ class World:
             bursts=BURSTS,
         )
         assert outcome.job is not None
+        if take:
+            taken = self.store.take_ready(self.now)
+            assert taken is not None and taken.id == outcome.job.id
+            return taken
         return outcome.job
 
     def jobs(self) -> list[tuple[int, str, str | None, str | None, str | None]]:
@@ -313,7 +319,6 @@ def test_a_setup_problem_fails_at_once_without_running_the_agent(world: World) -
 
 def test_a_crash_during_decide_reruns_it_once_on_the_next_start(world: World) -> None:
     job = world.job()
-    world.store.take_ready(NOW)
     world.fake.answers = [Crash(), answer("ignore")]
     with pytest.raises(Crash):
         world.processor.run_job(job.id)
@@ -327,7 +332,6 @@ def test_a_crash_during_decide_reruns_it_once_on_the_next_start(world: World) ->
 def test_a_stop_signal_during_a_run_leaves_the_job_running(world: World) -> None:
     """The signal handler raises Stop inside the agent run; the loop must end, not fail the job."""
     job = world.job()
-    world.store.take_ready(NOW)
     world.fake.answers = [Stop()]
     with pytest.raises(Stop), captured_logs() as log:
         world.processor.run_job(job.id)
@@ -405,7 +409,6 @@ def test_housekeeping_runs_hourly_and_prunes_orphan_threads(world: World) -> Non
 
 def test_a_job_pruned_while_running_leaves_no_thread(world: World) -> None:
     job = world.job()
-    world.store.take_ready(NOW)
     connection = sqlite3.connect(world.store.path)
     connection.execute("DELETE FROM job_posts")
     connection.execute("DELETE FROM jobs")
@@ -417,11 +420,11 @@ def test_a_job_pruned_while_running_leaves_no_thread(world: World) -> None:
 
 
 def test_run_forever_takes_jobs_oldest_first(world: World) -> None:
-    first = world.job(post_id="a")
+    first = world.job(post_id="a", take=False)
     world.now += 1
-    second = world.job(post_id="b")
+    second = world.job(post_id="b", take=False)
     world.now += 1
-    third = world.job(post_id="c")
+    third = world.job(post_id="c", take=False)
     world.fake.answers = [answer("ignore"), answer("remember", memory="m"), Crash()]
     with pytest.raises(Crash):
         world.processor.run_forever()  # the third job's run is "killed", which ends the loop
@@ -441,3 +444,16 @@ def test_log_stream_is_text_free_even_with_a_drafts_listing(world: World) -> Non
         format_drafts(read_drafts(world.store.path), now=NOW)
     assert DRAFT_CANARY not in log.getvalue()
     assert isinstance(log, io.StringIO)
+
+
+def test_only_one_processor_holds_the_lock(world: World) -> None:
+    state = world.store.path.parent
+    hold_lock(state)
+    try:
+        assert ((state / LOCK_FILE).stat().st_mode & 0o777) == 0o600
+        with pytest.raises(SettingsError, match="another processor is running"):
+            hold_lock(state)
+    finally:
+        release_lock()
+    hold_lock(state)  # free again once the first holder is gone
+    release_lock()
