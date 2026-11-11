@@ -143,10 +143,12 @@ def _roots(agent_root: Path) -> Roots:
     for root in roots:
         if not inside(root, agent_root) or root == agent_root:
             raise SettingsError("a folder under AGENT_ROOT points outside it (a symlink?)")
-    # Disjoint, or a project could contain every conversation (conversations -> projects/x/c).
-    for root in roots:
-        if any(other != root and inside(root, other) for other in roots):
-            raise SettingsError("the folders under AGENT_ROOT overlap (a symlink?)")
+    # Disjoint, or a project could contain every conversation (conversations -> projects/x/c),
+    # and distinct, or a scenario could be a conversation (conversations -> scenarios).
+    if len(set(roots)) != 3 or any(
+        inside(root, other) for root in roots for other in roots if other != root
+    ):
+        raise SettingsError("the folders under AGENT_ROOT overlap (a symlink?)")
     return roots
 
 

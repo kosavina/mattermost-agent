@@ -145,6 +145,12 @@ def test_overlapping_roots_are_refused(root: Path) -> None:
         load_processor_settings(env(root))
 
 
+def test_two_roots_resolving_to_the_same_folder_are_refused(root: Path) -> None:
+    (root / "conversations").symlink_to(root / "scenarios")
+    with pytest.raises(SettingsError, match="overlap"):
+        load_processor_settings(env(root))
+
+
 def test_a_dangling_root_symlink_is_refused_without_a_path(root: Path) -> None:
     (root / "projects").symlink_to(root / "nonexistent")
     with pytest.raises(SettingsError, match="cannot create or open") as info:
