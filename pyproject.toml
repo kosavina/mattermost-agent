@@ -26,6 +26,17 @@ dev = [
     "ruff>=0.17.4",
     "ty==0.0.99",
 ]
+# The processor runs natively on the Mac and needs these; the listener's container does not, and
+# some of them (zstandard, through langgraph) have no Linux wheel for this Python, so the
+# Dockerfile installs with --no-default-groups.
+processor = [
+    "langgraph==1.2.20",
+    "langgraph-checkpoint-sqlite==3.1.3",
+    "pydantic>=2.14.3",
+]
+
+[tool.uv]
+default-groups = ["dev", "processor"]
 
 [tool.ruff]
 line-length = 100
@@ -39,6 +50,10 @@ select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+filterwarnings = [
+    # langsmith, pulled in by langgraph, is not yet ready for Python 3.16; not our code.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+]
 
 [tool.ty.terminal]
 error-on-warning = true
