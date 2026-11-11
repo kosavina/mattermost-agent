@@ -101,7 +101,7 @@ A rule may also set `reply`, which says what happens to the agent's reply:
 | `draft` | the reply is put into that chat's message box as a Mattermost draft | you |
 | `send` | the reply is posted at once with a label, if every check passes; otherwise it becomes a draft. The rule must list its senders in `from` | the listener |
 
-A rule without `reply` uses `replies.default`, which is `draft` unless the file says otherwise. The modes are read and checked already, but delivery is not built yet: until it is, every reply waits on the terminal as with `local`.
+A rule without `reply` uses `replies.default`, which is `draft` unless the file says otherwise. Delivery to Mattermost is not built yet. Until it is, a `draft` or `send` reply waits in the processor's outbox, where `mattermost-agent drafts` shows it with its text and `mattermost-agent outbox` without; set `replies.default: local` to keep approving on the terminal.
 
 The file ends with two more sections, both required:
 
@@ -190,7 +190,7 @@ A scenario folder must hold `AGENTS.md`, the instructions the agent gets, and mu
 
 The processor refuses to start if any `MM_*` variable is set (it must never hold the token), if a folder is on `/Volumes`, if a folder under the agent root points outside it or overlaps another, if the state folder or the Codex home is inside a folder the agent may read, or if a backend's version is not the one these adapters were tested with (`codex-cli 0.167.0`, Claude Code `2.1.311`; bumping a pin is a code change that requires the live tests below).
 
-**Running it.** Both processes must run from the same checkout: the processor adds columns to the shared database (schema version 3), and an older listener would refuse the file.
+**Running it.** Both processes must run from the same checkout: the processor adds columns and the outbox table to the shared database (schema version 4), and an older listener would refuse the file.
 
 ```sh
 # Terminal 1, the listener
@@ -202,13 +202,14 @@ STATE_DIR=~/agent/state AGENT_ROOT=~/agent RULES_FILE=~/agent/rules.yaml uv run 
 | Command | What it does |
 | --- | --- |
 | `mattermost-agent process` | Runs the processor until Ctrl+C or SIGTERM, which also kills the agent run in progress |
-| `mattermost-agent drafts` | Lists the jobs waiting for approval, with their drafts |
-| `mattermost-agent approve <id>`, `reject <id>` | Decides a draft. Nothing is sent in this version |
+| `mattermost-agent drafts` | Lists every reply that still has its text: the `local` drafts waiting for approval, and the replies in the outbox that are not delivered yet or never will be (refused, failed, expired) |
+| `mattermost-agent approve <id>`, `reject <id>` | Decides a `local` draft. A local draft is never sent |
+| `mattermost-agent outbox` | Lists the replies queued for Mattermost, without their text: mode, place, state, outcome, the check that turned a `send` into a draft, and age |
 | `mattermost-agent memory <channel_id>` | Shows a conversation's memory and how many earlier versions exist |
 | `mattermost-agent memory forget <channel_id>` | Overwrites every file of that conversation with zeros and removes the folder |
-| `mattermost-agent jobs [id]` | As before, now with the backend, the decision and the failure reason |
+| `mattermost-agent jobs [id]` | As before, now with the backend, the decision, how the reply is delivered and the failure reason |
 
-A draft nobody decides within 3 days fails as `expired`. Jobs are still deleted 7 days after they opened; memory is not, until you forget it. A job that fails three times in a row (an agent error, a timeout, or an answer that does not fit the schema) ends as `failed`. A job whose scenario or rule is missing from the files, or whose folders do not check out, fails at once without running an agent.
+A reply that starts with `/` is never queued for a message box, where Enter would run it as a slash command; it is kept as `refused_command` and shown by `drafts`. A draft nobody decides within 3 days fails as `expired`. Jobs are still deleted 7 days after they opened; memory is not, until you forget it. A job that fails three times in a row (an agent error, a timeout, or an answer that does not fit the schema) ends as `failed`. A job whose scenario or rule is missing from the files, or whose folders do not check out, fails at once without running an agent.
 
 **How the agents are confined.** Codex runs with a permission profile the processor writes for every run: reads in the scenario folder, the conversation folder and the attached projects only, no writes anywhere (the temp folders are denied too), no network. Claude Code runs with `--restricted` and only the `Read`, `Glob` and `Grep` tools, confined to the same folders; it has no shell, no write and no fetch tool. The burst and the memory go to the agent on standard input, inside a data block whose markers carry a random nonce per run, with the instruction that nothing inside is to be followed. Agent stderr goes to `/dev/null`, and each run gets a private temp folder that is removed afterwards.
 
@@ -289,12 +290,13 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 
 `reason` is one of `auth_rejected` (the token is wrong or expired), `unreachable`, `server_error`, `protocol_error`, `store_error` or `signal`.
 
-The processor adds four events:
+The processor adds five events:
 
 ```text
 event=agent_run  job=12 backend=codex scenario="intake" decision=act duration_s=10.8 attempt=1 denials=0
 event=agent_error job=12 backend=claude reason=timeout exit_code=null attempt=2
 event=memory_saved job=12 channel="<channel_id>" chars=812 version=4
+event=reply_planned job=12 mode=draft downgrade=link outcome=queued chars=640
 event=job_done   job=12 status=waiting_approval fail_reason=null
 ```
 
@@ -303,6 +305,7 @@ event=job_done   job=12 status=waiting_approval fail_reason=null
 | `agent_run` | One agent run finished with `decision`. `denials` is how many tool calls the agent's own controls refused (Claude reports them; Codex cannot) |
 | `agent_error` | A run failed: `exit` (non-zero exit code), `timeout`, `invalid_json` or `invalid_output` (an answer that does not fit the schema), `denied_startup`. It is tried again up to three times |
 | `memory_saved` | The conversation's memory was replaced; `chars` is its length and `version` its number |
+| `reply_planned` | A reply went to the outbox. `mode` is `draft` or `send`; `downgrade` names the check that turned a `send` into a draft (`needs_review`, `length`, `mention`, `link`); `outcome` is `queued`, or `refused_command` for a reply that starts with `/`; `chars` is its length |
 | `job_done` | The job left the processor: `status` is `waiting_approval`, `done` or `failed`, and `fail_reason` one of `agent_failed`, `agent_timeout`, `invalid_output`, `unknown_scenario`, `unknown_rule`, `bad_folder`, `expired` |
 
 `LOG_LEVEL` in `.env` sets the level: `DEBUG`, `INFO`, `WARNING` or `ERROR`. The default is `INFO`.
