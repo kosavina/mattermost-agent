@@ -25,6 +25,7 @@ from mattermost_agent.agents import (
 )
 from mattermost_agent.agents.prompt import build_prompt
 from mattermost_agent.agents.schema import validate_answer
+from mattermost_agent.jobs import safe_text
 from mattermost_agent.store import JobPost
 
 USAGE = "usage: python -m mattermost_agent.agents.demo <codex|claude> <scenario>"
@@ -99,7 +100,11 @@ def main(arguments: list[str]) -> int:
     except AgentError as error:
         raise SystemExit(f"demo: the agent run failed: {error.reason}") from None
     print(f"backend={result.backend} duration_s={result.duration_s:.1f} denials={result.denials}")
-    print(json.dumps(answer.model_dump(), indent=2, ensure_ascii=False))
+    shown = {
+        key: None if value is None else safe_text(value)
+        for key, value in answer.model_dump().items()
+    }
+    print(json.dumps(shown, indent=2, ensure_ascii=False))
     return 0
 
 

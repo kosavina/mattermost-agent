@@ -133,8 +133,8 @@ def test_claude_command_is_the_verified_one() -> None:
         str(CONVERSATION),
         "--add-dir",
         str(PROJECT),
-        "--append-system-prompt",
-        "# Intake\nReply in English.",
+        "--append-system-prompt-file",
+        str(SCENARIO / "AGENTS.md"),
         "--output-format",
         "json",
         "--json-schema",
@@ -152,10 +152,11 @@ def test_claude_command_has_one_add_dir_per_read_dir() -> None:
     assert "--add-dir" not in argv
 
 
-def test_the_prompt_is_never_an_argument() -> None:
+def test_no_text_is_ever_an_argument() -> None:
+    """argv is visible to every local user: the prompt goes on stdin, instructions by file."""
     for backend in (CODEX, CLAUDE):
         argv, _ = backend.command(TASK, RUN_DIR)
-        assert all("hello" not in item for item in argv)
+        assert all("hello" not in item and "Intake" not in item for item in argv)
 
 
 def test_env_has_exactly_the_allowed_keys() -> None:

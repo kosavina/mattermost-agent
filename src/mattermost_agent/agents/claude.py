@@ -2,7 +2,8 @@
 directory and the read dirs.
 
 `--restricted` and `--setting-sources ""` keep Claude from loading settings, plugins, hooks and
-any CLAUDE.md or AGENTS.md on disk, so the instructions go in with `--append-system-prompt`.
+any CLAUDE.md or AGENTS.md on disk, so the scenario's AGENTS.md goes in with
+`--append-system-prompt-file`.
 Bash, Write and WebFetch do not exist in the run. Refused tool calls come back in the JSON, as
 `permission_denials`; their number is logged, never their content.
 """
@@ -19,6 +20,7 @@ from mattermost_agent.agents.port import AgentError, AgentResult, AgentTask, Bac
 from mattermost_agent.agents.schema import OUTPUT_SCHEMA
 
 TOOLS = "Read,Glob,Grep"
+INSTRUCTIONS_FILE = "AGENTS.md"
 SYSTEM_PATH = "/usr/bin:/bin"
 CHECK_TIMEOUT_S = 30.0
 
@@ -59,8 +61,9 @@ class ClaudeBackend:
         for path in dict.fromkeys(task.read_dirs):
             argv += ["--add-dir", str(path)]
         argv += [
-            "--append-system-prompt",
-            task.instructions,
+            # The file, not the text: argv is visible to every local user, and has a size limit.
+            "--append-system-prompt-file",
+            str(task.scenario_dir / INSTRUCTIONS_FILE),
             "--output-format",
             "json",
             "--json-schema",
