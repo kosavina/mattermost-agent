@@ -131,3 +131,49 @@ def test_stale_run_folders_are_cleared(tmp_path: Path) -> None:
     assert clear_stale_tmp(tmp_path) == 2
     assert list(root.iterdir()) == []
     assert clear_stale_tmp(tmp_path) == 0
+
+
+def test_a_group_kill_the_system_refuses_still_kills_the_leader(
+    fake: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS answers EPERM to killpg when one member cannot be signalled; the run must still end."""
+
+    def refusing(pgid: int, sig: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(os, "killpg", refusing)
+    pid_file = tmp_path / "grandchild.pid"
+    with pytest.raises(AgentError) as info:
+        locked_run(argv(fake, "hang", str(pid_file)), {}, cwd=tmp_path, stdin="", timeout_s=2)
+    assert info.value.reason == "timeout"
+
+
+def test_kill_running_kills_the_run_in_progress(fake: Path, tmp_path: Path) -> None:
+    import threading
+
+    from mattermost_agent.agents.locked_run import kill_running
+
+    assert kill_running() is False
+    pid_file = tmp_path / "grandchild.pid"
+    errors: list[AgentError] = []
+
+    def run() -> None:
+        try:
+            locked_run(argv(fake, "hang", str(pid_file)), {}, cwd=tmp_path, stdin="", timeout_s=30)
+        except AgentError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    deadline = time.monotonic() + 5
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert kill_running() is True
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert [error.reason for error in errors] == ["exit"]
+    grandchild = int(pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while alive(grandchild) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not alive(grandchild)
