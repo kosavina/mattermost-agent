@@ -19,6 +19,8 @@ from pathlib import Path
 from mattermost_agent.agents.port import AgentError
 
 TMP_DIR_NAME = "tmp"
+# The agent process of the run in progress, so that a shutdown can kill it from a signal handler.
+_running: subprocess.Popen[bytes] | None = None
 # Exit codes of a shell that could not run the program: not found, not executable.
 STARTUP_EXIT_CODES = frozenset({126, 127})
 
@@ -55,10 +57,31 @@ def run_folder(state_dir: Path) -> Generator[Path]:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _kill_group(process: subprocess.Popen[bytes]) -> None:
-    """Kill the process and everything it started. start_new_session made it the group leader."""
-    with suppress(ProcessLookupError):
+def _signal_group(process: subprocess.Popen[bytes]) -> None:
+    """Send SIGKILL to the process and everything it started, as far as the system allows.
+
+    start_new_session made the process the group leader. On macOS, killpg reports EPERM when any
+    member could not be signalled although the others were, so the leader is also killed directly
+    and neither error may stop a shutdown.
+    """
+    with suppress(ProcessLookupError, PermissionError):
         os.killpg(process.pid, signal.SIGKILL)
+    with suppress(ProcessLookupError, PermissionError):
+        process.kill()
+
+
+def kill_running() -> bool:
+    """Kill the agent run in progress, if any, with its whole process group. Say whether one was."""
+    process = _running
+    if process is None:
+        return False
+    _signal_group(process)
+    return True
+
+
+def _kill_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill the process group and reap the process."""
+    _signal_group(process)
     with suppress(subprocess.TimeoutExpired, OSError, ValueError):
         process.communicate(timeout=5)
 
@@ -76,6 +99,7 @@ def locked_run(
     Raises AgentError: `denied_startup` if the program cannot start, `timeout` after killing the
     whole process group, `exit` on a non-zero exit code. No exception carries the agent's output.
     """
+    global _running
     started = time.monotonic()
     try:
         # argv is built by our code from checked settings and folders, never from a message.
@@ -90,6 +114,7 @@ def locked_run(
         )
     except (FileNotFoundError, PermissionError, NotADirectoryError) as error:
         raise AgentError("denied_startup") from error
+    _running = process
     try:
         stdout, _ = process.communicate(stdin.encode("utf-8"), timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -99,6 +124,8 @@ def locked_run(
         # Ctrl+C, SystemExit, or anything else: the agent must not outlive us.
         _kill_group(process)
         raise
+    finally:
+        _running = None
     duration = time.monotonic() - started
     if process.returncode != 0:
         if process.returncode in STARTUP_EXIT_CODES:

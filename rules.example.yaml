@@ -8,7 +8,10 @@
 #             out otherwise, because dm: false is refused
 #   channels  the name in the channel's URL (town-square), not its title (Town Square)
 #   from      usernames, without the @. Your own posts match only a rule that lists you here
-#   scenario  a label for the processor; it is kept with the job and logged
+#   scenario  the processor's scenario for the job (see scenarios.yaml in the scenarios repo)
+#   read      optional: project folders under ~/agent/projects that the agent may read for this
+#             rule, by folder name. Without it, the agent sees only the scenario and the
+#             conversation's own memory
 #
 # Quote words that YAML reads as something else: "on", "off", "yes", "no", "null", or a number.
 rules:
@@ -19,6 +22,7 @@ rules:
     channels: [analytics]
     from: [example.user]
     scenario: intake
+    read: [sales-reports]
 
 limits:
   jobs_per_hour: 20          # new jobs opened in any 60 minutes; posts joining a job don't count

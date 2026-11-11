@@ -140,10 +140,32 @@ def test_long_text_is_cut(output: io.StringIO) -> None:
     assert "x" * (logs.MAX_LOGGED_TEXT + 1) not in output.getvalue()
 
 
-@pytest.mark.parametrize("function", [logs.log_post, logs.log_job, logs.log_lifecycle])
+@pytest.mark.parametrize(
+    "function",
+    [
+        logs.log_post,
+        logs.log_job,
+        logs.log_lifecycle,
+        logs.log_agent_run,
+        logs.log_agent_error,
+        logs.log_memory_saved,
+        logs.log_job_done,
+    ],
+)
 def test_no_parameter_can_carry_text_or_secrets(function: object) -> None:
     assert callable(function)
     allowed = {
+        # The processor's: a backend name, a decision word, numbers and a reason word.
+        "backend",
+        "decision",
+        "duration_s",
+        "attempt",
+        "denials",
+        "exit_code",
+        "channel_id",
+        "chars",
+        "version",
+        "fail_reason",
         "event",
         "kind",
         "channel",

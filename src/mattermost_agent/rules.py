@@ -18,11 +18,13 @@ from mattermost_agent.events import Post
 TOP_LEVEL_KEYS = frozenset({"rules", "limits", "bursts"})
 LIMIT_KEYS = frozenset({"jobs_per_hour"})
 BURST_KEYS = ("quiet_seconds", "max_wait_seconds", "max_posts")
-RULE_KEYS = frozenset({"name", "scenario", "dm", "channels", "from"})
+RULE_KEYS = frozenset({"name", "scenario", "dm", "channels", "from", "read"})
 CONDITION_KEYS = frozenset({"dm", "channels", "from"})
 
 CHANNEL_NAME = re.compile(r"[a-z0-9_-]+", re.IGNORECASE)
 USERNAME = re.compile(r"[a-z0-9._-]+", re.IGNORECASE)
+# A folder name under the agent root: one path segment, so no `/`, no `..`, not absolute or hidden.
+FOLDER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 class RulesError(Exception):
@@ -38,6 +40,8 @@ class Rule:
     dm: bool
     channels: frozenset[str]
     senders: frozenset[str]
+    read: tuple[str, ...] = ()
+    """Project folders the processor attaches read-only, by name under the agent root."""
 
 
 @dataclass(frozen=True)
@@ -78,7 +82,8 @@ def _unique_keys(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict[Hashab
 _StrictLoader.add_constructor(_StrictLoader.DEFAULT_MAPPING_TAG, _unique_keys)
 
 
-def _parse_yaml(text: str) -> object:
+def parse_yaml(text: str) -> object:
+    """Parse YAML strictly (safe loader, no duplicate keys), or raise RulesError."""
     try:
         return yaml.load(text, Loader=_StrictLoader)  # noqa: S506 - a subclass of SafeLoader
     except yaml.MarkedYAMLError as error:
@@ -113,6 +118,20 @@ def _text_list(value: object, where: str, pattern: re.Pattern[str]) -> list[str]
     return items
 
 
+def folder_names(value: object, where: str) -> tuple[str, ...]:
+    """Return a list of distinct folder names, each a single lower-case path segment."""
+    if not isinstance(value, list) or not value:
+        raise RulesError(f"{where} must be a list with at least one item")
+    names = tuple(_text(item, f"{where} item") for item in value)
+    if not all(FOLDER_NAME.fullmatch(name) for name in names):
+        raise RulesError(
+            f"{where} must hold folder names: lower-case letters, digits, - and _, no / or ."
+        )
+    if len(set(names)) != len(names):
+        raise RulesError(f"{where} names a folder twice")
+    return names
+
+
 def _whole_number(value: object, where: str) -> int:
     # `type` and not isinstance: YAML `true` is a bool, and a bool is a kind of int in Python.
     if type(value) is not int or value < 1:
@@ -143,6 +162,7 @@ def _rule(value: object, number: int) -> Rule:
         senders=frozenset(
             _text_list(raw["from"], f"{where} from", USERNAME) if "from" in raw else ()
         ),
+        read=folder_names(raw["read"], f"{where} read") if "read" in raw else (),
     )
 
 
@@ -156,7 +176,7 @@ def _bursts(value: object) -> Bursts:
 
 def parse_rules(text: str) -> RuleSet:
     """Return the checked rules, or raise RulesError."""
-    top = _mapping(_parse_yaml(text), "the file", TOP_LEVEL_KEYS)
+    top = _mapping(parse_yaml(text), "the file", TOP_LEVEL_KEYS)
     raw_rules = top.get("rules")
     if not isinstance(raw_rules, list) or not raw_rules:
         raise RulesError("rules must be a list with at least one rule")
