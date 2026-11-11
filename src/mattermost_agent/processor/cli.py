@@ -84,8 +84,13 @@ def decide_draft(env: Mapping[str, str], job_id: int, *, approved: bool) -> int:
         draft = store.take_waiting(job_id, time.time())
         if draft is None:
             raise SystemExit(f"mattermost-agent: job {job_id} is not waiting for approval")
+        graph = build_graph(runtime)
         try:
-            build_graph(runtime).invoke(Command(resume=approved), thread(job_id))
+            # Resuming a thread without a checkpoint would start the graph afresh, and so run the
+            # agent from this command. Only a paused thread may be continued.
+            if not graph.get_state(thread(job_id)).tasks:
+                raise LookupError
+            graph.invoke(Command(resume=approved), thread(job_id))
         except Exception:
             # Put the job back as it was, so that the next try or the expiry can handle it.
             job = draft.job

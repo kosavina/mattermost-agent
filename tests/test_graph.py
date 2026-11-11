@@ -251,6 +251,18 @@ def test_approve_and_reject_finish_the_job(
         decide_draft(world.env, job.id, approved=True)
 
 
+def test_approve_without_a_checkpoint_never_runs_the_agent(world: World) -> None:
+    """A waiting row whose thread is gone must not make the approve command start the graph."""
+    job = world.job()
+    world.fake.answers = [answer("act", draft=DRAFT_CANARY), answer("ignore")]
+    world.processor.run_job(job.id)
+    world.runtime.checkpointer.delete_thread(str(job.id))
+    with pytest.raises(SystemExit, match="could not be resumed"):
+        decide_draft(world.env, job.id, approved=True)
+    assert world.jobs() == [(job.id, "waiting_approval", "act", None, None)]
+    assert len(world.fake.tasks) == 1
+
+
 def test_retries_then_success(world: World) -> None:
     job = world.job()
     world.fake.answers = [AgentError("exit", 3), AgentError("timeout"), answer("ignore")]

@@ -110,7 +110,7 @@ class Processor:
         orphans = {
             int(thread_id)
             for thread_id in thread_ids(self.runtime.checkpointer)
-            if thread_id.isdigit()
+            if thread_id.isascii() and thread_id.isdigit()
         } - self.runtime.store.job_ids()
         for job_id in orphans:
             forget_thread(self.runtime.checkpointer, job_id)
