@@ -329,6 +329,14 @@ def test_a_crash_during_decide_reruns_it_once_on_the_next_start(world: World) ->
     assert len(world.fake.tasks) == 2
 
 
+def test_a_crash_before_the_first_checkpoint_starts_the_job_afresh(world: World) -> None:
+    job = world.job()  # taken, but the processor died before invoking the graph
+    world.fake.answers = [answer("ignore")]
+    Processor(world.runtime, poll_s=0.01).resume_running()
+    assert world.jobs() == [(job.id, "done", "ignore", None, None)]
+    assert len(world.fake.tasks) == 1
+
+
 def test_a_stop_signal_during_a_run_leaves_the_job_running(world: World) -> None:
     """The signal handler raises Stop inside the agent run; the loop must end, not fail the job."""
     job = world.job()

@@ -3,7 +3,8 @@
 One worker. A job is taken with a compare-and-set, run to its end or to its approval pause, and
 its status written from what the graph returned: an interrupt means `waiting_approval`, a final
 state `done`, an exception `failed` with a reason. A finished job's checkpoint thread is deleted
-at once. At startup, jobs left in `running` by a crash are continued with invoke(None). Hourly,
+at once. At startup, jobs left in `running` by a crash are continued with invoke(None), or started
+from the beginning if the crash came before their first checkpoint. Hourly,
 drafts older than three days expire and checkpoint threads whose job is gone are deleted.
 
 Only one processor may run per state folder: `processor.lock` there is held with flock for the
@@ -84,8 +85,14 @@ class Processor:
         self.last_housekeeping: float | None = None
 
     def run_job(self, job_id: int, resume: bool = False) -> None:
-        """Invoke the graph for one job (from the start, or continuing after a crash) and record."""
+        """Invoke the graph for one job (from the start, or continuing after a crash) and record.
+
+        A job taken by a processor that died before its first checkpoint has no thread to
+        continue: it is started from the beginning.
+        """
         store, now = self.runtime.store, self.runtime.clock
+        if resume and self.runtime.checkpointer.get_tuple(thread(job_id)) is None:
+            resume = False
         try:
             result = self.graph.invoke(None if resume else {"job_id": job_id}, thread(job_id))
         except AgentError as error:
