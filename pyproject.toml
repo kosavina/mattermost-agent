@@ -50,6 +50,9 @@ select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "live: runs the real agents on the Mac; skipped unless AGENT_LIVE=1, never in CI",
+]
 filterwarnings = [
     # langsmith, pulled in by langgraph, is not yet ready for Python 3.16; not our code.
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",

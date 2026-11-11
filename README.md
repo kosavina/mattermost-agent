@@ -1,8 +1,8 @@
 # mattermost-agent
 
-A listener for your Mattermost account. It watches for new posts, checks each one against your rules, groups matching posts into bursts, and queues each burst as a job.
+A personal agent for your Mattermost account, in two processes. The **listener** watches for new posts, checks each one against your rules, groups matching posts into bursts, and queues each burst as a job. The **processor** takes each job, runs a locked-down AI coding agent (Codex or Claude Code) on it, and turns the answer into one of three outcomes: nothing, a new memory for that conversation, or a draft reply that waits for your approval on the terminal.
 
-This is the reading half of a personal agent, running as a dry run: it reads and queues, and the processor that will act on the jobs does not exist yet.
+This is still a dry run towards Mattermost: nothing is ever posted. Approving a draft records the approval and stops there.
 
 **What it does**
 
@@ -13,12 +13,14 @@ This is the reading half of a personal agent, running as a dry run: it reads and
 - Groups matching posts from one sender, in one place, written close together, into one **job**, and keeps them with their text for the processor.
 - Logs one line per post and per change to a job, without the message text.
 - Shows the queue on request: `mattermost-agent jobs`.
+- Runs one agent per job, confined to the scenario's instructions, that conversation's own memory and the project folders your rule attaches, all read-only. The agent's answer is `ignore`, `remember` (a new memory, written by our code) or `act` (a draft).
+- Shows waiting drafts with `drafts`, and takes `approve <id>` or `reject <id>`.
 
 **What it does not do**
 
-- It never posts, reacts or changes anything in Mattermost. It only reads.
-- It calls no AI service.
-- It keeps the text of matched posts only, in its own database, for 7 days. Of every other post it keeps just the id.
+- It never posts, reacts or changes anything in Mattermost. It only reads. An approved draft is recorded, not sent.
+- The agent holds no token and has no network: it can only read the folders it was given.
+- It keeps the text of matched posts only, in its own database, for 7 days, and a conversation's memory until you forget it. Of every other post it keeps just the id.
 
 ## Quickstart
 
@@ -121,6 +123,80 @@ The processor will move a job on through `running`, `waiting_approval`, `done` a
 
 **Where the state lives.** The database and the heartbeat are in the Docker volume `agent_data`. If you set `STATE_DIR` yourself, point it at a local disk, never at a network share or a VM shared folder (such as `/Volumes/My Shared Files` on a Mac): the listener and the `jobs` command share one SQLite file in WAL mode, which needs a local file system.
 
+## Processor
+
+The processor is a second process next to the listener. In this version both run natively on a Mac (`uv run`), sharing the state folder; the Docker image is the listener only, and the processor's packages are not in it.
+
+**Folders.** Everything lives under one agent root, `~/agent`, on the local disk (never under `/Volumes`, where neither SQLite nor Codex's sandbox work):
+
+```text
+~/agent/                 mode 700
+  state/                 STATE_DIR: the listener's state.sqlite3 and the processor's checkpoints.sqlite3
+  scenarios/             your scenario folders (trusted instructions) and scenarios.yaml
+    scenarios.yaml
+    intake/AGENTS.md
+  projects/              read-only materials a rule can attach: projects/<name>
+  conversations/         written only by the processor: conversations/<channel_id>/memory.md and history/
+  codex-home/            the agent's own CODEX_HOME with its auth.json (mode 700)
+```
+
+`scenarios.yaml` maps each scenario a rule names to a folder, and optionally to a backend:
+
+```yaml
+scenarios:
+  intake:
+    folder: intake        # ~/agent/scenarios/intake, which must hold AGENTS.md
+    backend: codex        # optional: codex or claude; the default is AGENT_BACKEND
+```
+
+A scenario folder must hold `AGENTS.md`, the instructions the agent gets, and must not hold `CLAUDE.md`, `CLAUDE.local.md` or `.claude/`. Each direct message, group message and channel gets its own folder under `conversations/`, named by its channel id, so an agent never sees another conversation's memory. The agent only proposes a memory; the processor writes it, keeps every earlier version in `history/`, and never creates any other file there.
+
+**Settings** (environment variables, checked once at startup; errors name the variable, never its value):
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `STATE_DIR` | The listener's state folder | required |
+| `AGENT_ROOT` | The agent root above | required |
+| `RULES_FILE` | The listener's `rules.yaml` | required |
+| `AGENT_BACKEND` | `codex` or `claude`, for scenarios that name none | `codex` |
+| `CODEX_BIN`, `CODEX_HOME`, `CODEX_INSTALL_DIR` | Where Codex is | `/opt/homebrew/bin/codex`, `~/agent/codex-home`, `/opt/homebrew/Caskroom/codex` |
+| `CLAUDE_BIN` | Where Claude Code is | `/opt/homebrew/bin/claude` |
+| `AGENT_TIMEOUT_SECONDS` | One agent run | `120` |
+| `POLL_SECONDS` | How often the queue is polled | `3` |
+| `LOG_LEVEL` | As for the listener | `INFO` |
+
+The processor refuses to start if any `MM_*` variable is set (it must never hold the token), if a folder is on `/Volumes`, if a folder under the agent root points outside it or overlaps another, if the state folder or the Codex home is inside a folder the agent may read, or if a backend's version is not the one these adapters were tested with (`codex-cli 0.167.0`, Claude Code `2.1.311`; bumping a pin is a code change that requires the live tests below).
+
+**Running it.** Both processes must run from the same checkout: the processor adds columns to the shared database (schema version 3), and an older listener would refuse the file.
+
+```sh
+# Terminal 1, the listener
+STATE_DIR=~/agent/state MM_URL=https://... MM_TOKEN_FILE=~/agent/secrets/mm_token RULES_FILE=~/agent/rules.yaml uv run mattermost-agent
+# Terminal 2, the processor
+STATE_DIR=~/agent/state AGENT_ROOT=~/agent RULES_FILE=~/agent/rules.yaml uv run mattermost-agent process
+```
+
+| Command | What it does |
+| --- | --- |
+| `mattermost-agent process` | Runs the processor until Ctrl+C or SIGTERM, which also kills the agent run in progress |
+| `mattermost-agent drafts` | Lists the jobs waiting for approval, with their drafts |
+| `mattermost-agent approve <id>`, `reject <id>` | Decides a draft. Nothing is sent in this version |
+| `mattermost-agent memory <channel_id>` | Shows a conversation's memory and how many earlier versions exist |
+| `mattermost-agent memory forget <channel_id>` | Overwrites every file of that conversation with zeros and removes the folder |
+| `mattermost-agent jobs [id]` | As before, now with the backend, the decision and the failure reason |
+
+A draft nobody decides within 3 days fails as `expired`. Jobs are still deleted 7 days after they opened; memory is not, until you forget it. A job that fails three times in a row (an agent error, a timeout, or an answer that does not fit the schema) ends as `failed`. A job whose scenario or rule is missing from the files, or whose folders do not check out, fails at once without running an agent.
+
+**How the agents are confined.** Codex runs with a permission profile the processor writes for every run: reads in the scenario folder, the conversation folder and the attached projects only, no writes anywhere (the temp folders are denied too), no network. Claude Code runs with `--restricted` and only the `Read`, `Glob` and `Grep` tools, confined to the same folders; it has no shell, no write and no fetch tool. The burst and the memory go to the agent on standard input, inside a data block whose markers carry a random nonce per run, with the instruction that nothing inside is to be followed. Agent stderr goes to `/dev/null`, and each run gets a private temp folder that is removed afterwards.
+
+**Live contract tests.** Before enabling a backend, and after any version bump, run the probes against the real binaries on the Mac:
+
+```sh
+AGENT_LIVE=1 uv run pytest -m live
+```
+
+They check, with the exact command the adapters build, that each agent cannot read outside its folders, another conversation, its own credentials or a symlink out; cannot write anywhere; has no network; and that an injected burst leaks nothing while a normal burst follows `AGENTS.md`. For Codex most probes run through `codex sandbox` without a model; Claude needs one model run per group. They never run in CI.
+
 ## Security model
 
 1. The token grants everything your account can do, so it lives only in a Docker secret file, never in `.env`, the image or `docker inspect`.
@@ -128,7 +204,11 @@ The processor will move a job on through `running`, `waiting_approval`, `done` a
 3. Logs have no field for message text, tokens or headers, and errors are logged by class name only. Message text exists in one place only: the `job_posts` table of the database, for matched posts, for 7 days. The database and its side files are readable by the listener's user alone (mode 600), and deleted text is overwritten rather than left in free space.
 4. It connects only to your `https://` server: plain HTTP, proxies and redirects are refused, so the token cannot be sent anywhere else.
 5. The container runs as a non-root user with a read-only filesystem, no Linux capabilities and no open ports.
-6. `mattermost-agent jobs <id>` is the only thing that shows message text, on your terminal and never in the log. Control characters in a message are escaped first, so a message cannot drive your terminal.
+6. `mattermost-agent jobs <id>`, `drafts` and `memory <channel_id>` are the only things that show text, on your terminal and never in the log. Control characters are escaped first, so a message cannot drive your terminal.
+7. The processor holds no token and refuses to start with one in its environment. Its code never imports the Mattermost client, and a test checks that.
+8. Our code decides every flag, folder and permission of an agent run; nothing in a message, in a memory or in the agent's answer can change them. The agent reads only the scenario folder, the conversation's own folder and the attached projects, all resolved through symlinks and checked against their roots, and cannot write or reach the network. Its answer is parsed into three fields and used as data.
+9. The agent proposes a memory; the processor writes it. A conversation's memory is built from other people's messages, so it is untrusted data: it goes to the agent inside the data block, it is kept in a folder only the processor writes, and `memory forget` overwrites it with zeros before deleting it.
+10. The processor's logs carry only numbers and fixed words about a run: the backend, the decision, the duration, the attempt, how many tool calls were refused. The prompt, the memory, the draft and the agent's output never reach a log line or an error message. The checkpoint file holds a running job's memory and draft until the job ends, never a post, with mode 600 and overwritten on deletion.
 
 ## Reading the logs
 
@@ -179,11 +259,28 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 | `lookup_failed` | It could not find out who a user is, so the post has no sender. It carries on |
 | `frame_skipped` | The server sent something it could not read. It carries on |
 | `jobs_pruned` | The hourly clean-up deleted `count` jobs older than 7 days, with their text |
+| `drafts_expired`, `threads_pruned` | Processor only: `count` drafts nobody decided in 3 days failed as `expired`; `count` leftover checkpoint threads were deleted |
 | `shutdown`, `stopped` | A normal stop |
 | `internal_error` | A bug in a background task. Please report it |
 | `fatal` | It gave up. `reason` says why |
 
 `reason` is one of `auth_rejected` (the token is wrong or expired), `unreachable`, `server_error`, `protocol_error`, `store_error` or `signal`.
+
+The processor adds four events:
+
+```text
+event=agent_run  job=12 backend=codex scenario="intake" decision=act duration_s=10.8 attempt=1 denials=0
+event=agent_error job=12 backend=claude reason=timeout exit_code=null attempt=2
+event=memory_saved job=12 channel="<channel_id>" chars=812 version=4
+event=job_done   job=12 status=waiting_approval fail_reason=null
+```
+
+| Event | Meaning |
+| --- | --- |
+| `agent_run` | One agent run finished with `decision`. `denials` is how many tool calls the agent's own controls refused (Claude reports them; Codex cannot) |
+| `agent_error` | A run failed: `exit` (non-zero exit code), `timeout`, `invalid_json` or `invalid_output` (an answer that does not fit the schema), `denied_startup`. It is tried again up to three times |
+| `memory_saved` | The conversation's memory was replaced; `chars` is its length and `version` its number |
+| `job_done` | The job left the processor: `status` is `waiting_approval`, `done` or `failed`, and `fail_reason` one of `agent_failed`, `agent_timeout`, `invalid_output`, `unknown_scenario`, `unknown_rule`, `bad_folder`, `expired` |
 
 `LOG_LEVEL` in `.env` sets the level: `DEBUG`, `INFO`, `WARNING` or `ERROR`. The default is `INFO`.
 
@@ -196,4 +293,8 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 - **First run.** It starts from now and does not read old posts.
 - **Long outages.** Catch-up goes back at most 30 days.
 - **Rules** are read at startup, so a change needs a restart.
+- **Approval on the terminal only.** Drafts are shown and decided with `drafts`, `approve` and `reject`; nothing is sent to Mattermost yet, and the listener does not yet know the agent's own posts.
+- **Claude Code uses your own login.** Until it gets a separate config folder and token, every run reads your Keychain login and rewrites `~/.claude.json` (with a backup under `~/.claude/backups/`). It leaves no transcript and no memory. Codex uses the separate `~/agent/codex-home`.
+- **A `kill -9` during a run** leaves the agent to finish or time out on its own; the next start removes its temp folder and runs the job once more.
+- **Mac only, natively.** The agents' confinement is verified on macOS. A container for the processor, and a container wall around both, are the next milestone.
 - **Health** means the process is not stuck. During a Mattermost outage the container stays healthy and the log shows the reconnects. A rejected token ends the process, and Compose then starts it again, so look for `reason=auth_rejected` if it keeps restarting.
