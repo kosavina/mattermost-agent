@@ -422,7 +422,7 @@ def test_the_wal_files_are_private_too(store: Store, path: Path) -> None:
         connection.close()
 
 
-def test_text_can_live_only_in_job_posts_message(store: Store, path: Path) -> None:
+def test_text_can_live_only_in_job_posts_message_and_jobs_draft(store: Store, path: Path) -> None:
     connection = sqlite3.connect(path)
     try:
         tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -450,6 +450,14 @@ def test_text_can_live_only_in_job_posts_message(store: Store, path: Path) -> No
             "deadline_at",
             "updated_at",
             "post_count",
+            # The processor's columns. `draft` is the agent's reply, the second place with text.
+            "sender",
+            "backend",
+            "decision",
+            "draft",
+            "fail_reason",
+            "approval",
+            "finished_at",
         },
         "job_posts": {"post_id", "job_id", "create_at", "kind", "message"},
     }
@@ -562,5 +570,5 @@ def test_reading_a_database_of_another_version_fails_clearly(store: Store, path:
         connection.execute("PRAGMA user_version = 99")
     finally:
         connection.close()
-    with pytest.raises(StoreError, match="unknown schema version 99"):
+    with pytest.raises(StoreError, match="schema version 99; start the listener or the processor"):
         read_jobs(path)

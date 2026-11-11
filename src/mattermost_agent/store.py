@@ -2,12 +2,14 @@
 
 It holds the ids of handled posts, the last-seen time, and the jobs: bursts of matched posts, with
 their text. Message text lives in job_posts.message and nowhere else, and only a post that matched
-a rule has a row there. Post times (create_at, last-seen) are the server's Unix milliseconds. `now`
-and the job times are this machine's Unix seconds.
+a rule has a row there. The processor adds the agent's decision and draft to the job's row. Post
+times (create_at, last-seen) are the server's Unix milliseconds. `now` and the job times are this
+machine's Unix seconds.
 
 Every operation opens its own short connection, and the queries are tiny, so they run directly on
-the event loop. The `jobs` command reads the same file through read_jobs and read_job, read-only,
-while the listener runs.
+the event loop. The `jobs` and `drafts` commands read the same file through read_jobs, read_job and
+read_drafts, read-only, while the listener and the processor run. The listener owns a job up to
+`ready`; the processor owns it from there (take_ready is the hand-over, a compare-and-set).
 """
 
 import os
@@ -23,15 +25,29 @@ from mattermost_agent.events import Post
 from mattermost_agent.rules import Bursts, Rule
 
 FILE_NAME = "state.sqlite3"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
+# A draft nobody approved or rejected in this time fails as `expired`.
+DRAFT_RETENTION_SECONDS = 3 * 24 * 60 * 60
 CAP_WINDOW_SECONDS = 3600
 
 type JobStatus = Literal["collecting", "ready", "running", "waiting_approval", "done", "failed"]
 JOB_STATUSES: tuple[str, ...] = get_args(JobStatus.__value__)
+type FailReason = Literal[
+    "agent_failed",
+    "agent_timeout",
+    "invalid_output",
+    "unknown_scenario",
+    "unknown_rule",
+    "bad_folder",
+    "expired",
+]
+FAIL_REASONS: tuple[str, ...] = get_args(FailReason.__value__)
+type Approval = Literal["approved", "rejected"]
+APPROVALS: tuple[str, ...] = get_args(Approval.__value__)
 
-# The statuses after `ready` belong to the processor, which will set them.
+# The statuses after `ready` and the nullable columns from `sender` on belong to the processor.
 SCHEMA = (
     """
     CREATE TABLE handled (
@@ -62,7 +78,14 @@ SCHEMA = (
         ready_at REAL NOT NULL,
         deadline_at REAL NOT NULL,
         updated_at REAL NOT NULL,
-        post_count INTEGER NOT NULL
+        post_count INTEGER NOT NULL,
+        sender TEXT,
+        backend TEXT,
+        decision TEXT,
+        draft TEXT,
+        fail_reason TEXT,
+        approval TEXT,
+        finished_at REAL
     )
     """,
     "CREATE UNIQUE INDEX jobs_one_collecting ON jobs (conversation_key) "
@@ -80,7 +103,27 @@ SCHEMA = (
     """,
     "CREATE INDEX job_posts_job_id ON job_posts (job_id, create_at)",
 )
-JOB_COLUMNS = "id, status, scenario, rule, place, post_count, opened_at, ready_at, deadline_at"
+# From one schema version to the next, each in one transaction. Version 2 → 3: the processor's
+# columns, all nullable, so the listener's rows need no values.
+MIGRATIONS: dict[int, tuple[str, ...]] = {
+    2: tuple(
+        f"ALTER TABLE jobs ADD COLUMN {column}"
+        for column in (
+            "sender TEXT",
+            "backend TEXT",
+            "decision TEXT",
+            "draft TEXT",
+            "fail_reason TEXT",
+            "approval TEXT",
+            "finished_at REAL",
+        )
+    ),
+}
+# In the order of Job's fields.
+JOB_COLUMNS = (
+    "id, status, scenario, rule, place, post_count, opened_at, ready_at, deadline_at, "
+    "channel_id, sender, backend, decision, fail_reason, approval, finished_at"
+)
 
 type Claim = Literal["duplicate", "unmatched", "cap_hit", "opened", "joined"]
 
@@ -91,7 +134,7 @@ class StoreError(Exception):
 
 @dataclass(frozen=True)
 class Job:
-    """One burst. Times are this machine's Unix seconds."""
+    """One burst, without its text. Times are this machine's Unix seconds."""
 
     id: int
     status: JobStatus
@@ -102,6 +145,13 @@ class Job:
     opened_at: float
     ready_at: float
     deadline_at: float
+    channel_id: str = ""
+    sender: str | None = None
+    backend: str | None = None
+    decision: str | None = None
+    fail_reason: str | None = None
+    approval: str | None = None
+    finished_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +162,14 @@ class JobPost:
     create_at: int
     kind: str
     message: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class Draft:
+    """A job waiting for approval, with its draft. repr() leaves out the text."""
+
+    job: Job
+    text: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -132,6 +190,15 @@ def _jobs(connection: sqlite3.Connection, tail: str, params: tuple[object, ...])
     """Return the jobs selected by `tail`, a fixed clause whose values come in as parameters."""
     rows = connection.execute(f"SELECT {JOB_COLUMNS} FROM jobs {tail}", params)  # noqa: S608
     return [Job(*row) for row in rows]
+
+
+def _posts(connection: sqlite3.Connection, job_id: int) -> list[JobPost]:
+    rows = connection.execute(
+        "SELECT post_id, create_at, kind, message FROM job_posts "
+        "WHERE job_id = ? ORDER BY create_at, post_id",
+        (job_id,),
+    )
+    return [JobPost(*row) for row in rows]
 
 
 def _close(connection: sqlite3.Connection, job: Job, now: float) -> Job:
@@ -206,9 +273,13 @@ class Store:
             if version == 0:
                 for statement in SCHEMA:
                     connection.execute(statement)
-                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            elif version != SCHEMA_VERSION:
+            elif version != SCHEMA_VERSION and version not in MIGRATIONS:
                 raise sqlite3.DatabaseError(f"unknown schema version {version}")
+            while version in MIGRATIONS:
+                for statement in MIGRATIONS[version]:
+                    connection.execute(statement)
+                version += 1
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def claim(
         self,
@@ -217,6 +288,7 @@ class Store:
         kind: Kind,
         rule: Rule | None,
         place: str | None,
+        sender: str | None = None,
         live: bool,
         now: float,
         cap: int,
@@ -299,11 +371,13 @@ class Store:
                 opened_at=now,
                 ready_at=now + bursts.quiet_seconds,
                 deadline_at=now + bursts.max_wait_seconds,
+                channel_id=post.channel_id,
+                sender=sender,
             )
             row = connection.execute(
                 "INSERT INTO jobs (conversation_key, channel_id, root_id, sender_id, place, rule, "
-                "scenario, status, opened_at, ready_at, deadline_at, updated_at, post_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                "scenario, status, opened_at, ready_at, deadline_at, updated_at, post_count, "
+                "sender) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 (
                     key,
                     post.channel_id,
@@ -318,6 +392,7 @@ class Store:
                     job.deadline_at,
                     now,
                     1,
+                    sender,
                 ),
             ).fetchone()
             job = replace(job, id=row[0])
@@ -344,6 +419,97 @@ class Store:
             connection.execute(
                 "INSERT OR IGNORE INTO last_seen (id, create_at) VALUES (1, ?)", (create_at,)
             )
+
+    def take_ready(self, now: float) -> Job | None:
+        """Move the oldest ready job to `running` and return it, or None if there is none.
+
+        A compare-and-set: a second processor started by mistake cannot take the same job.
+        """
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "UPDATE jobs SET status = 'running', updated_at = ? "  # noqa: S608 - constant columns
+                "WHERE id = (SELECT id FROM jobs WHERE status = 'ready' ORDER BY ready_at, id "
+                f"LIMIT 1) AND status = 'ready' RETURNING {JOB_COLUMNS}",
+                (now,),
+            ).fetchall()
+        return Job(*rows[0]) if rows else None
+
+    def take_waiting(self, job_id: int, now: float) -> Draft | None:
+        """Move one waiting job to `running` for its approval, and return it with its draft."""
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "UPDATE jobs SET status = 'running', updated_at = ? "  # noqa: S608 - constant columns
+                f"WHERE id = ? AND status = 'waiting_approval' RETURNING {JOB_COLUMNS}, draft",
+                (now, job_id),
+            ).fetchall()
+        if not rows:
+            return None
+        *columns, draft = rows[0]
+        return Draft(Job(*columns), draft or "")
+
+    def jobs_in(self, status: JobStatus) -> list[Job]:
+        """Return every job in `status`, oldest first."""
+        with self._transaction() as connection:
+            return _jobs(connection, "WHERE status = ? ORDER BY id", (status,))
+
+    def job_ids(self) -> set[int]:
+        with self._transaction() as connection:
+            return {row[0] for row in connection.execute("SELECT id FROM jobs")}
+
+    def posts(self, job_id: int) -> list[JobPost]:
+        """Return the job's posts with their text, oldest first."""
+        with self._transaction() as connection:
+            return _posts(connection, job_id)
+
+    def set_waiting(
+        self, job_id: int, *, backend: str, decision: str, draft: str, now: float
+    ) -> None:
+        """Record the agent's draft and wait for approval."""
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'waiting_approval', backend = ?, decision = ?, "
+                "draft = ?, updated_at = ? WHERE id = ?",
+                (backend, decision, draft, now, job_id),
+            )
+
+    def set_done(
+        self,
+        job_id: int,
+        *,
+        now: float,
+        backend: str | None = None,
+        decision: str | None = None,
+        approval: Approval | None = None,
+    ) -> None:
+        """Finish the job. Values left None keep what set_waiting recorded."""
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'done', backend = COALESCE(?, backend), "
+                "decision = COALESCE(?, decision), approval = ?, finished_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (backend, decision, approval, now, now, job_id),
+            )
+
+    def set_failed(
+        self, job_id: int, *, reason: FailReason, now: float, backend: str | None = None
+    ) -> None:
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE jobs SET status = 'failed', fail_reason = ?, "
+                "backend = COALESCE(?, backend), finished_at = ?, updated_at = ? WHERE id = ?",
+                (reason, backend, now, now, job_id),
+            )
+
+    def expire_drafts(self, now: float) -> list[Job]:
+        """Fail every draft that waited longer than DRAFT_RETENTION_SECONDS, and return them."""
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "UPDATE jobs SET status = 'failed', fail_reason = 'expired', "  # noqa: S608
+                "finished_at = ?, updated_at = ? WHERE status = 'waiting_approval' "
+                f"AND updated_at < ? RETURNING {JOB_COLUMNS}",
+                (now, now, now - DRAFT_RETENTION_SECONDS),
+            ).fetchall()
+        return [Job(*row) for row in rows]
 
     def prune(self, now: float) -> Pruned:
         """Forget old posts and old jobs, with their text, and return how many of each.
@@ -391,7 +557,9 @@ def _read_only(path: Path) -> Generator[sqlite3.Connection]:
             connection.execute("PRAGMA busy_timeout = 5000")
             version = connection.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
-                raise sqlite3.DatabaseError(f"unknown schema version {version}")
+                raise sqlite3.DatabaseError(
+                    f"schema version {version}; start the listener or the processor once to update"
+                )
             yield connection
         finally:
             connection.close()
@@ -411,9 +579,14 @@ def read_job(path: Path, job_id: int) -> tuple[Job, list[JobPost]] | None:
         found = _jobs(connection, "WHERE id = ?", (job_id,))
         if not found:
             return None
+        return found[0], _posts(connection, job_id)
+
+
+def read_drafts(path: Path) -> list[Draft]:
+    """Return every job waiting for approval with its draft, oldest first."""
+    with _read_only(path) as connection:
         rows = connection.execute(
-            "SELECT post_id, create_at, kind, message FROM job_posts "
-            "WHERE job_id = ? ORDER BY create_at, post_id",
-            (job_id,),
+            f"SELECT {JOB_COLUMNS}, draft FROM jobs "  # noqa: S608 - a constant column list
+            "WHERE status = 'waiting_approval' ORDER BY id"
         )
-        return found[0], [JobPost(*row) for row in rows]
+        return [Draft(Job(*row[:-1]), row[-1] or "") for row in rows]

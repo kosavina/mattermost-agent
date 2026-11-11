@@ -167,6 +167,7 @@ async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> N
         kind=kind,
         rule=rule,
         place=place,
+        sender=sender,
         live=live,
         now=runtime.clock(),
         cap=runtime.rules.jobs_per_hour,
