@@ -138,6 +138,20 @@ def test_a_root_that_is_a_symlink_out_is_refused(root: Path, tmp_path: Path) -> 
         load_processor_settings(env(root))
 
 
+def test_overlapping_roots_are_refused(root: Path) -> None:
+    (root / "projects" / "foo" / "conv").mkdir(parents=True)
+    (root / "conversations").symlink_to(root / "projects" / "foo" / "conv")
+    with pytest.raises(SettingsError, match="overlap"):
+        load_processor_settings(env(root))
+
+
+def test_a_dangling_root_symlink_is_refused_without_a_path(root: Path) -> None:
+    (root / "projects").symlink_to(root / "nonexistent")
+    with pytest.raises(SettingsError, match="cannot create or open") as info:
+        load_processor_settings(env(root))
+    assert str(root) not in str(info.value)
+
+
 def test_state_dir_inside_a_read_root_is_refused(root: Path) -> None:
     with pytest.raises(SettingsError, match="STATE_DIR is inside a folder the agents may read"):
         load_processor_settings(env(root, STATE_DIR=str(root / "scenarios" / "state")))

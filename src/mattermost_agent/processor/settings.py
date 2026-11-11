@@ -129,14 +129,24 @@ def _roots(agent_root: Path) -> Roots:
         raise SettingsError("AGENT_ROOT is not a folder")
     if not (agent_root / "scenarios").is_dir():
         raise SettingsError("AGENT_ROOT has no scenarios/ folder")
-    for name in ("projects", "conversations"):
-        (agent_root / name).mkdir(mode=0o700, exist_ok=True)
-    roots = Roots(
-        *((agent_root / name).resolve() for name in ("scenarios", "projects", "conversations"))
-    )
+    try:
+        for name in ("projects", "conversations"):
+            (agent_root / name).mkdir(mode=0o700, exist_ok=True)
+        roots = Roots(
+            *(
+                (agent_root / name).resolve(strict=True)
+                for name in ("scenarios", "projects", "conversations")
+            )
+        )
+    except OSError:
+        raise SettingsError("cannot create or open the folders under AGENT_ROOT") from None
     for root in roots:
         if not inside(root, agent_root) or root == agent_root:
             raise SettingsError("a folder under AGENT_ROOT points outside it (a symlink?)")
+    # Disjoint, or a project could contain every conversation (conversations -> projects/x/c).
+    for root in roots:
+        if any(other != root and inside(root, other) for other in roots):
+            raise SettingsError("the folders under AGENT_ROOT overlap (a symlink?)")
     return roots
 
 

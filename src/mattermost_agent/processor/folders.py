@@ -51,11 +51,14 @@ def conversation_dir(roots: Roots, channel_id: str) -> Path:
         raise JobSetupError("bad_folder")
     path = roots.conversations / channel_id
     try:
+        if path.is_symlink():
+            raise JobSetupError("bad_folder")
         path.mkdir(mode=0o700, exist_ok=True)
         resolved = path.resolve(strict=True)
     except OSError:
         raise JobSetupError("bad_folder") from None
-    if not (resolved.is_dir() and resolved.parent == roots.conversations):
+    # The exact folder, not just a folder in conversations/: a link to a sibling would pass that.
+    if not (resolved.is_dir() and resolved == path):
         raise JobSetupError("bad_folder")
     return resolved
 

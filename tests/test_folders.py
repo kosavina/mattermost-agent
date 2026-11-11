@@ -122,6 +122,17 @@ def test_a_conversation_folder_that_is_a_symlink_is_refused(roots: Roots, tmp_pa
     assert reason(roots) == "bad_folder"
 
 
+def test_a_conversation_folder_linked_to_a_sibling_is_refused(roots: Roots) -> None:
+    sibling = roots.conversations / ("b" * 26)
+    sibling.mkdir()
+    (sibling / "memory.md").write_text("theirs")
+    (roots.conversations / CHANNEL).symlink_to(sibling)
+    assert reason(roots) == "bad_folder"
+    (roots.conversations / CHANNEL).unlink()
+    (roots.conversations / CHANNEL).symlink_to("/nonexistent")
+    assert reason(roots) == "bad_folder"
+
+
 @pytest.mark.parametrize("name", ["missing", "sales/.."])
 def test_a_project_that_does_not_exist(roots: Roots, name: str) -> None:
     assert reason(roots, rules=rules(rule(read=(name,)))) == "bad_folder"
