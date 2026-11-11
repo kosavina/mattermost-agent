@@ -122,7 +122,7 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
 # In the order of Job's fields.
 JOB_COLUMNS = (
     "id, status, scenario, rule, place, post_count, opened_at, ready_at, deadline_at, "
-    "channel_id, sender, backend, decision, fail_reason, approval, finished_at"
+    "channel_id, sender, backend, decision, fail_reason, approval, finished_at, root_id"
 )
 
 type Claim = Literal["duplicate", "unmatched", "cap_hit", "opened", "joined"]
@@ -152,6 +152,7 @@ class Job:
     fail_reason: str | None = None
     approval: str | None = None
     finished_at: float | None = None
+    root_id: str = ""
 
 
 @dataclass(frozen=True)
