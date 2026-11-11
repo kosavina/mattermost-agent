@@ -81,7 +81,7 @@ def test_not_a_text_mention(message: str) -> None:
 
 
 def test_own_post_is_kept() -> None:
-    assert not is_ignored(make_post(user_id=ME.user_id))
+    assert not is_ignored(make_post(user_id=ME.user_id), ME)
 
 
 @pytest.mark.parametrize("mentions", [None, frozenset({ME.user_id})])
@@ -91,16 +91,26 @@ def test_my_own_name_in_my_post_is_not_a_mention(mentions: frozenset[str] | None
 
 
 def test_system_post_is_ignored() -> None:
-    assert is_ignored(make_post(post_type="system_join_channel"))
+    assert is_ignored(make_post(post_type="system_join_channel"), ME)
 
 
 def test_deleted_post_is_ignored() -> None:
-    assert is_ignored(make_post(deleted=True))
+    assert is_ignored(make_post(deleted=True), ME)
 
 
 def test_ordinary_post_is_kept() -> None:
-    assert not is_ignored(make_post())
+    assert not is_ignored(make_post(), ME)
 
 
 def test_other_post_types_are_kept() -> None:
-    assert not is_ignored(make_post(post_type="slack_attachment"))
+    assert not is_ignored(make_post(post_type="slack_attachment"), ME)
+
+
+def test_my_own_post_with_our_marker_is_ignored() -> None:
+    """A reply our code posted comes back as my own post, and must not open a job."""
+    assert is_ignored(make_post(user_id=ME.user_id, from_agent=True), ME)
+
+
+def test_another_users_post_with_our_marker_is_kept() -> None:
+    """Anyone can set a prop on their post. That must not hide it."""
+    assert not is_ignored(make_post(from_agent=True), ME)

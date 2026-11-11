@@ -73,6 +73,9 @@ class Runtime:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     jitter: Callable[[], float] = random.random
     on_stop: Callable[[], None] = start_watchdog
+    # Delivers the outbox's replies once the listener knows who it is. Without one, nothing
+    # is ever written to Mattermost. It lives in deliver.py, which imports this module.
+    deliver: Callable[[Runtime, Me], Awaitable[None]] | None = None
 
 
 def backoff_delay(failures: int, jitter: float) -> float:
@@ -85,7 +88,7 @@ def backoff_delay(failures: int, jitter: float) -> float:
     return ceiling * (0.5 + jitter / 2)
 
 
-def _is_passing(error: MattermostError) -> bool:
+def is_passing(error: MattermostError) -> bool:
     """Say whether the same call could work a moment later."""
     return (
         error.reason == "unreachable"
@@ -104,7 +107,7 @@ async def _with_retries[**P, T](
         try:
             return await call(*args, **kwargs)
         except MattermostError as error:
-            if not _is_passing(error):
+            if not is_passing(error):
                 raise
         await runtime.sleep(delay)
     return await call(*args, **kwargs)
@@ -119,7 +122,7 @@ async def _username(runtime: Runtime, user_id: str, *, live: bool) -> str | None
     try:
         return await _with_retries(runtime, runtime.client.username, user_id)
     except MattermostError as error:
-        if error.reason == "auth_rejected" or (_is_passing(error) and not live):
+        if error.reason == "auth_rejected" or (is_passing(error) and not live):
             raise
         log_lifecycle(
             "lookup_failed", reason=error.reason, status=error.status, error=error.__cause__
@@ -154,7 +157,7 @@ def _log_job(event: JobEvent, job: Job) -> None:
 
 
 async def _handle_post(runtime: Runtime, me: Me, post: Post, *, live: bool) -> None:
-    if is_ignored(post):
+    if is_ignored(post, me):
         return
     kind = classify(post, me)
     sender = await _username(runtime, post.user_id, live=live)
@@ -214,7 +217,7 @@ async def _catch_up(runtime: Runtime, me: Me) -> None:
         try:
             result = await _with_retries(runtime, runtime.client.posts_since, channel, floor)
         except MattermostError as error:
-            if error.reason == "auth_rejected" or _is_passing(error):
+            if error.reason == "auth_rejected" or is_passing(error):
                 raise
             # Only this channel is affected, and repeating the catch-up would not change that.
             log_lifecycle("channel_skipped", reason=error.reason, status=error.status)
@@ -273,14 +276,23 @@ async def _listen(runtime: Runtime, me: Me) -> None:
         await runtime.sleep(delay)
 
 
-async def _start_and_listen(runtime: Runtime) -> None:
+async def _start_and_listen(runtime: Runtime, known: asyncio.Future[Me]) -> None:
     identity = await runtime.client.get_me()
+    known.set_result(identity.me)
     server_now = identity.server_time_ms or int(runtime.clock() * 1000)
     # On the first run there is no history to read. Catch-up starts OVERLAP_MS before last-seen,
     # so this makes the first catch-up start from now.
     runtime.store.set_first_last_seen(server_now + OVERLAP_MS)
     log_lifecycle("startup")
     await _listen(runtime, identity.me)
+
+
+async def _deliver(
+    runtime: Runtime, deliver: Callable[[Runtime, Me], Awaitable[None]], known: asyncio.Future[Me]
+) -> None:
+    """Start delivering once the token's owner is known: the checks need to know whose posts
+    are mine. Until then, and through an outage at startup, replies simply wait in the outbox."""
+    await deliver(runtime, await known)
 
 
 def _beat(path: Path) -> None:
@@ -322,10 +334,13 @@ def healthcheck(env: Mapping[str, str]) -> int:
 
 async def run(runtime: Runtime) -> None:
     """Run until cancelled, or raise the error that made running impossible."""
+    known: asyncio.Future[Me] = asyncio.get_running_loop().create_future()
     tasks = {
         asyncio.create_task(_housekeeping(runtime)),
-        asyncio.create_task(_start_and_listen(runtime)),
+        asyncio.create_task(_start_and_listen(runtime, known)),
     }
+    if runtime.deliver is not None:
+        tasks.add(asyncio.create_task(_deliver(runtime, runtime.deliver, known)))
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:

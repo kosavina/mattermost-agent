@@ -20,9 +20,12 @@ from helpers import captured_logs, make_post, posted_event, raw_post, squeezed
 from websockets.asyncio.server import Server, ServerConnection, serve
 
 from mattermost_agent import __main__ as entry
-from mattermost_agent import app
+from mattermost_agent import app, deliver
+from mattermost_agent.deliver import Deliverer
+from mattermost_agent.events import AGENT_PROP, Me
 from mattermost_agent.logs import configure_logging
 from mattermost_agent.mattermost import MattermostClient, MattermostError, open_events
+from mattermost_agent.mattermost_write import MattermostWriter
 from mattermost_agent.rules import Bursts, parse_rules
 from mattermost_agent.store import (
     FILE_NAME,
@@ -31,6 +34,7 @@ from mattermost_agent.store import (
     Store,
     StoreError,
     read_jobs,
+    read_outbox,
 )
 
 TOKEN = "abcdefghijklmnopqrstuvwxyz"
@@ -92,6 +96,7 @@ class World:
         self.sleeps: list[float] = []
         self.connect_failures: list[MattermostError] = []
         self.stops = 0
+        self.deliver: Callable[[app.Runtime, Me], Awaitable[None]] | None = None
         self.client = MattermostClient(
             "https://chat.example.com", TOKEN, transport=httpx2.MockTransport(self.rest)
         )
@@ -161,6 +166,7 @@ class World:
             sleep=fake_sleep,
             jitter=lambda: 1.0,
             on_stop=stopped,
+            deliver=self.deliver,
         )
 
     def go(self, scenario: Scenario) -> None:
@@ -1073,3 +1079,145 @@ def test_main_healthcheck_needs_no_token(
     with pytest.raises(SystemExit) as stopped:
         entry.main()
     assert stopped.value.code == 0
+
+
+MARKED = {AGENT_PROP: True, "from_pat": "true"}
+
+
+def test_a_reply_our_code_posted_opens_no_job(world: World) -> None:
+    """It comes back over the socket as a post of mine. The rule below names me, and still."""
+    world.rules_text = RULES.replace("from: [example.user]", "from: [example.user, example.me]")
+    ours = frame("ours", user_id="me-id", channel_type="O", channel_name="requests", props=MARKED)
+    mine = frame("mine", LATER + 1, user_id="me-id", channel_type="O", channel_name="requests")
+    world.scripts = [Script([ours, mine])]
+    world.go(lambda: until(lambda: world.handled("mine")))
+    assert not world.handled("ours")
+    assert len(world.lines("post")) == 1 and len(world.lines("job_opened")) == 1
+    assert [job.post_count for job in read_jobs(world.store.path)] == [1]
+
+
+def test_another_users_post_with_our_marker_is_handled_as_usual(world: World) -> None:
+    world.scripts = [Script([frame("theirs", props=MARKED)])]
+    world.go(lambda: until(lambda: world.handled("theirs")))
+    assert 'rule="dm-from-anyone"' in world.lines("post")[0]
+    assert len(world.lines("job_opened")) == 1
+
+
+def test_catch_up_skips_a_reply_our_code_posted(world: World) -> None:
+    world.rules_text = RULES.replace("from: [example.user]", "from: [example.user, example.me]")
+    world.store.set_first_last_seen(LATER)
+    world.channels = [channel("req", name="requests", kind="O", last_post_at=LATER + 30)]
+    world.posts["req"] = [
+        raw_post(id="ours", channel_id="req", user_id="me-id", create_at=LATER + 10, props=MARKED),
+        raw_post(id="mine", channel_id="req", user_id="me-id", create_at=LATER + 20),
+    ]
+    world.go(lambda: until(lambda: world.handled("mine")))
+    assert not world.handled("ours")
+    assert len(world.lines("post")) == 1
+
+
+def queue_a_draft(world: World, channel_id: str, text: str) -> int:
+    """Open a job in a chat and queue its reply, as the listener and the processor do."""
+    post = make_post(id="asked", channel_id=channel_id, channel_type="D", create_at=NOW_MS)
+    rule = parse_rules(world.rules_text).rules[0]
+    world.store.claim(
+        post,
+        kind="dm",
+        rule=rule,
+        place="@example.user",
+        sender="example.user",
+        live=True,
+        now=NOW,
+        cap=20,
+        bursts=Bursts(90, 600, 1),
+    )
+    job = world.store.take_ready(NOW)
+    assert job is not None
+    world.store.finish_with_reply(
+        job.id,
+        mode="draft",
+        root_id="",
+        message=text,
+        downgrade=None,
+        refused=False,
+        backend="fake",
+        decision="act",
+        now=NOW,
+    )
+    return job.id
+
+
+def test_the_listener_delivers_a_queued_reply_as_a_draft(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(deliver, "DELIVER_SECONDS", 0.01)
+    world.channels = [
+        channel("dm-1"),
+        {"id": "town", "name": "town", "type": "O", "last_post_at": 0, "team_id": "team-1"},
+    ]
+    job = queue_a_draft(world, "dm-1", SECRET_TEXT)
+    written: list[httpx2.Request] = []
+
+    def write(request: httpx2.Request) -> httpx2.Response:
+        written.append(request)
+        return httpx2.Response(200 if request.method == "GET" else 201, json=[])
+
+    writer = MattermostWriter(
+        "https://chat.example.com", TOKEN, allow_post=False, transport=httpx2.MockTransport(write)
+    )
+    world.deliver = Deliverer(writer, allow_send=False).run
+
+    async def scenario() -> None:
+        try:
+            await until(lambda: read_outbox(world.store.path)[0].state == "done")
+        finally:
+            await writer.aclose()
+
+    world.go(scenario)
+    assert [(r.method, r.url.path) for r in written] == [
+        ("GET", "/api/v4/users/me-id/teams/team-1/drafts"),
+        ("POST", "/api/v4/drafts"),
+    ]
+    body = json.loads(written[1].content)
+    assert (body["channel_id"], body["root_id"], body["message"]) == ("dm-1", "", SECRET_TEXT)
+    assert read_outbox(world.store.path)[0].outcome == "drafted"
+    assert f"event=reply_delivered job={job} mode=draft outcome=drafted" in world.log
+    assert SECRET_TEXT not in world.log
+    assert len(world.lines("startup")) == 1  # listening went on beside it
+
+
+def test_delivery_waits_for_the_login_and_a_rejected_token_stops_the_app(world: World) -> None:
+    world.me_status = 401
+    started: list[Me] = []
+
+    async def never(runtime: app.Runtime, me: Me) -> None:
+        started.append(me)
+
+    world.deliver = never
+
+    async def main() -> None:
+        async with serve(world.websocket, "127.0.0.1", 0) as server:
+            with pytest.raises(MattermostError) as error:
+                await app.run(world.runtime(address_of(server)))
+            assert error.value.reason == "auth_rejected"
+        await world.client.aclose()
+
+    asyncio.run(main())
+    assert started == []
+
+
+def test_a_token_rejected_while_delivering_stops_the_app(world: World) -> None:
+    async def rejected(runtime: app.Runtime, me: Me) -> None:
+        assert me == Me("me-id", "example.me")
+        raise MattermostError("auth_rejected", 401)
+
+    world.deliver = rejected
+
+    async def main() -> None:
+        async with serve(world.websocket, "127.0.0.1", 0) as server:
+            with pytest.raises(MattermostError) as error:
+                await app.run(world.runtime(address_of(server)))
+            assert error.value.reason == "auth_rejected"
+        await world.client.aclose()
+
+    asyncio.run(main())

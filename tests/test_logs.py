@@ -151,6 +151,9 @@ def test_long_text_is_cut(output: io.StringIO) -> None:
         logs.log_memory_saved,
         logs.log_job_done,
         logs.log_reply_planned,
+        logs.log_reply_delivered,
+        logs.log_draft_busy,
+        logs.log_reply_waiting,
     ],
 )
 def test_no_parameter_can_carry_text_or_secrets(function: object) -> None:
@@ -243,3 +246,42 @@ def test_reply_planned_line(output: io.StringIO) -> None:
         "event=reply_planned job=12 mode=draft downgrade=link outcome=queued chars=640\n" in lines
     )
     assert "job=13 mode=draft downgrade=null outcome=refused_command chars=5\n" in lines
+
+
+def test_reply_delivered_lines(output: io.StringIO) -> None:
+    logs.log_reply_delivered(
+        job_id=12,
+        mode="draft",
+        outcome="drafted",
+        downgrade="kill_switch",
+        reason=None,
+        channel_id="chat-1",
+    )
+    logs.log_reply_delivered(
+        job_id=13, mode="send", outcome="sent", downgrade=None, reason=None, channel_id="chat-1"
+    )
+    logs.log_reply_delivered(
+        job_id=14,
+        mode="draft",
+        outcome="failed",
+        downgrade=None,
+        reason="drafts_disabled",
+        channel_id="chat-1",
+    )
+    lines = squeezed(output.getvalue())
+    assert (
+        "event=reply_delivered job=12 mode=draft outcome=drafted downgrade=kill_switch "
+        'reason=null channel="chat-1"\n' in lines
+    )
+    assert 'job=13 mode=send outcome=sent downgrade=null reason=null channel="chat-1"\n' in lines
+    assert "job=14 mode=draft outcome=failed downgrade=null reason=drafts_disabled" in lines
+
+
+def test_waiting_lines(output: io.StringIO) -> None:
+    logs.log_draft_busy(job_id=14, channel_id="chat-1")
+    logs.log_reply_waiting(job_id=15, reason="unreachable", status=503, channel_id="chat-1")
+    logs.log_reply_waiting(job_id=16, reason="unconfirmed", status=None, channel_id="chat-1")
+    lines = squeezed(output.getvalue())
+    assert 'event=draft_busy job=14 channel="chat-1"\n' in lines
+    assert 'event=reply_waiting job=15 reason=unreachable status=503 channel="chat-1"\n' in lines
+    assert 'event=reply_waiting job=16 reason=unconfirmed status=null channel="chat-1"\n' in lines

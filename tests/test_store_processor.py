@@ -13,6 +13,7 @@ from mattermost_agent.store import (
     FILE_NAME,
     JOB_RETENTION_SECONDS,
     SCHEMA_VERSION,
+    Delivery,
     Draft,
     Job,
     Store,
@@ -118,6 +119,7 @@ def queue(
     root_id: str = "",
     downgrade: str | None = None,
     refused: bool = False,
+    now: float = NOW + 5,
 ) -> bool:
     """Finish a running job with a reply for the outbox, as the processor's loop does."""
     return store.finish_with_reply(
@@ -129,7 +131,7 @@ def queue(
         refused=refused,
         backend="codex",
         decision="act",
-        now=NOW + 5,
+        now=now,
     )
 
 
@@ -567,3 +569,119 @@ def test_an_outbox_row_is_pruned_with_its_job_and_its_text_leaves_the_files(
     assert [row.job_id for row in read_outbox(path)] == [new.id]
     assert [reply.text for reply in read_undelivered(path)] == ["kept"]
     assert CANARY.encode() not in b"".join(file.read_bytes() for file in folder.iterdir())
+
+
+def queued(store: Store, post_id: str, now: float, mode: DeliveryMode = "draft") -> int:
+    """Open, take and finish a job with a reply in the outbox, and return its id."""
+    job = ready_job(store, post_id, now=now)
+    store.take_ready(now)
+    assert queue(store, job.id, text=f"reply to {post_id}", mode=mode, now=now)
+    return job.id
+
+
+def test_take_outbox_is_oldest_first_and_once(store: Store, path: Path) -> None:
+    first = queued(store, "a", NOW)
+    second = queued(store, "b", NOW + 1)
+    taken = store.take_outbox(NOW + 10)
+    assert taken is not None and taken.row.job_id == first and taken.row.state == "delivering"
+    assert (taken.text, taken.rule, taken.sender, taken.sender_id) == (
+        "reply to a",
+        "dm",
+        "ivan",
+        "other-id",
+    )
+    assert taken.job_channel_id == taken.row.channel_id == CHANNEL
+    assert "reply to a" not in repr(taken)
+    other = Store(path).take_outbox(NOW + 11)  # a second listener cannot take the same reply
+    assert other is not None and other.row.job_id == second
+    assert store.take_outbox(NOW + 12) is None
+
+
+def test_a_postponed_reply_is_passed_over_until_its_time(store: Store, path: Path) -> None:
+    waiting = queued(store, "a", NOW)
+    ready = queued(store, "b", NOW + 1)
+    assert store.take_outbox(NOW + 2) is not None
+    assert store.postpone_outbox(waiting, reason="draft_busy", retry_at=NOW + 60, now=NOW + 2)
+    taken = store.take_outbox(NOW + 3)
+    assert taken is not None and taken.row.job_id == ready
+    assert store.take_outbox(NOW + 59) is None
+    again = store.take_outbox(NOW + 60)
+    assert again is not None and again.row.job_id == waiting and again.row.reason == "draft_busy"
+    # The same reason again is not news, and another one is.
+    assert not store.postpone_outbox(waiting, reason="draft_busy", retry_at=NOW + 120, now=NOW + 60)
+    assert store.take_outbox(NOW + 120) is not None
+    assert store.postpone_outbox(waiting, reason="unreachable", retry_at=NOW + 140, now=NOW + 120)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "kept"),
+    [
+        ("drafted", False),
+        ("sent", False),
+        ("skipped_answered", False),
+        ("failed", True),
+        ("expired", True),
+        ("refused_command", True),
+    ],
+)
+def test_finishing_a_reply_updates_its_job_and_empties_the_text_when_it_may(
+    store: Store, path: Path, outcome: Delivery, kept: bool
+) -> None:
+    job_id = queued(store, "a", NOW)
+    store.take_outbox(NOW + 1)
+    store.finish_outbox(job_id, outcome=outcome, now=NOW + 2, post_id="p", reason="why")
+    (row,) = read_outbox(path)
+    assert (row.state, row.outcome, row.post_id, row.reason, row.retry_at) == (
+        "done",
+        outcome,
+        "p",
+        "why",
+        None,
+    )
+    job = read_jobs(path)[0]
+    assert (job.status, job.reply_mode, job.delivery) == ("done", "draft", outcome)
+    assert [reply.text for reply in read_undelivered(path)] == (["reply to a"] if kept else [])
+    folder_bytes = b"".join(file.read_bytes() for file in path.parent.iterdir())
+    assert (b"reply to a" in folder_bytes) is kept
+    # A finished reply stays as it is.
+    store.finish_outbox(job_id, outcome="failed", now=NOW + 3)
+    assert read_outbox(path)[0].outcome == outcome
+    assert store.take_outbox(NOW + 4) is None
+
+
+def test_a_downgrade_is_for_good_and_shows_on_the_job(store: Store, path: Path) -> None:
+    job_id = queued(store, "a", NOW, mode="send")
+    store.take_outbox(NOW + 1)
+    store.downgrade_outbox(job_id, "kill_switch", NOW + 2)
+    (row,) = read_outbox(path)
+    assert (row.mode, row.state, row.downgrade) == ("draft", "delivering", "kill_switch")
+    assert read_jobs(path)[0].reply_mode == "draft"
+    store.downgrade_outbox(job_id, "stale", NOW + 3, requeue=True)  # already a draft: no change
+    (row,) = read_outbox(path)
+    assert (row.mode, row.state, row.downgrade) == ("draft", "delivering", "kill_switch")
+
+
+def test_only_replies_that_reached_no_one_are_released(store: Store, path: Path) -> None:
+    draft = queued(store, "a", NOW)
+    unstarted = queued(store, "b", NOW + 1, mode="send")
+    started = queued(store, "c", NOW + 2, mode="send")
+    for _ in range(3):
+        store.take_outbox(NOW + 3)
+    assert store.begin_send(started, now=NOW + 4, per_hour=9, per_chat=9) == "go"
+    assert store.release_outbox(NOW + 5) == 2
+    states = {row.job_id: row.state for row in read_outbox(path)}
+    assert states == {draft: "pending", unstarted: "pending", started: "delivering"}
+    assert [item.row.job_id for item in store.unconfirmed_sends(NOW + 4)] == [started]
+    assert store.unconfirmed_sends(NOW + 3) == []  # started later than that
+
+
+def test_replies_expire_three_days_after_they_were_queued(store: Store, path: Path) -> None:
+    old = queued(store, "a", NOW)
+    new = queued(store, "b", NOW + 100)
+    assert store.expire_outbox(NOW + DRAFT_RETENTION_SECONDS) == []
+    expired = store.expire_outbox(NOW + 1 + DRAFT_RETENTION_SECONDS)
+    assert [row.job_id for row in expired] == [old]
+    rows = {row.job_id: (row.state, row.outcome) for row in read_outbox(path)}
+    assert rows == {old: ("done", "expired"), new: ("pending", None)}
+    assert {job.id: job.delivery for job in read_jobs(path)} == {old: "expired", new: "queued"}
+    assert len(read_undelivered(path)) == 2  # the expired one keeps its text

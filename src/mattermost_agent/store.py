@@ -55,6 +55,10 @@ type Delivery = Literal[
     "drafted", "sent", "skipped_answered", "refused_command", "failed", "expired"
 ]
 QUEUED = "queued"
+# Outcomes after which the text stays in the row until the prune: it reached no message box, so
+# the `drafts` command is the only place left to read it.
+KEPT_TEXT = frozenset({"refused_command", "failed", "expired"})
+type SendVerdict = Literal["go", "cap", "chat_cap", "unconfirmed"]
 
 # The agent's reply on its way to Mattermost, one row per job. `message` is the third place with
 # text; the listener empties it once the reply is delivered. `root_id` is the thread the reply
@@ -175,6 +179,12 @@ OUTBOX_COLUMNS = (
     "o.reason, o.post_id, o.attempts, o.retry_at, o.created_at, o.updated_at, j.place"
 )
 OUTBOX_JOIN = "outbox o JOIN jobs j ON j.id = o.job_id"
+# A direct reply that counts against the caps: posted within the window, or perhaps posted (its
+# POST was started and has not been confirmed either way).
+COUNTED_SENDS = (
+    "FROM outbox WHERE ((outcome = 'sent' AND updated_at > ?) "
+    "OR (state = 'delivering' AND mode = 'send' AND attempts >= 1))"
+)
 
 type Claim = Literal["duplicate", "unmatched", "cap_hit", "opened", "joined"]
 
@@ -256,6 +266,19 @@ class Reply:
 
 
 @dataclass(frozen=True)
+class Outgoing:
+    """A reply the listener took to deliver: the row, its text, and what the checks need to know
+    of its job. repr() leaves out the text."""
+
+    row: OutboxRow
+    rule: str
+    sender_id: str
+    sender: str | None
+    job_channel_id: str
+    text: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class Outcome:
     """What became of a post: the job it opened or joined, and every job the call made ready."""
 
@@ -282,6 +305,18 @@ def _posts(connection: sqlite3.Connection, job_id: int) -> list[JobPost]:
         (job_id,),
     )
     return [JobPost(*row) for row in rows]
+
+
+def _outgoing(
+    connection: sqlite3.Connection, tail: str, params: tuple[object, ...]
+) -> list[Outgoing]:
+    """Return the outbox rows selected by `tail`, a fixed clause, with their text and job."""
+    rows = connection.execute(
+        f"SELECT {OUTBOX_COLUMNS}, j.rule, j.sender_id, j.sender, j.channel_id, o.message "  # noqa: S608
+        f"FROM {OUTBOX_JOIN} {tail}",
+        params,
+    )
+    return [Outgoing(OutboxRow(*row[:15]), *row[15:19], text=row[19] or "") for row in rows]
 
 
 def _close(connection: sqlite3.Connection, job: Job, now: float) -> Job:
@@ -639,6 +674,176 @@ class Store:
                 ),
             )
         return True
+
+    def take_outbox(self, now: float) -> Outgoing | None:
+        """Move the oldest reply that is due to `delivering` and return it, or None.
+
+        A compare-and-set, like take_ready. A reply told to wait (`retry_at`) is passed over until
+        then, so one busy chat does not hold up the others.
+        """
+        with self._transaction() as connection:
+            taken = connection.execute(
+                "UPDATE outbox SET state = 'delivering', updated_at = ? WHERE job_id = ("
+                "SELECT job_id FROM outbox WHERE state = 'pending' AND message IS NOT NULL "
+                "AND COALESCE(retry_at, 0) <= ? ORDER BY created_at, job_id LIMIT 1) "
+                "AND state = 'pending' RETURNING job_id",
+                (now, now),
+            ).fetchall()
+            if not taken:
+                return None
+            return _outgoing(connection, "WHERE o.job_id = ?", (taken[0][0],))[0]
+
+    def release_outbox(self, now: float) -> int:
+        """Put back the replies a crash left `delivering` that certainly reached no one.
+
+        That is a draft, because writing the same draft again changes nothing, and a direct reply
+        whose POST was never started. A direct reply whose POST was started stays where it is:
+        see unconfirmed_sends.
+        """
+        with self._transaction() as connection:
+            return connection.execute(
+                "UPDATE outbox SET state = 'pending', updated_at = ? "
+                "WHERE state = 'delivering' AND (mode = 'draft' OR attempts = 0)",
+                (now,),
+            ).rowcount
+
+    def unconfirmed_sends(self, before: float) -> list[Outgoing]:
+        """Return the direct replies whose POST was started before `before` and never confirmed.
+
+        They are never posted again. Only reading the chat can say what became of them.
+        """
+        with self._transaction() as connection:
+            return _outgoing(
+                connection,
+                "WHERE o.state = 'delivering' AND o.mode = 'send' AND o.attempts >= 1 "
+                "AND o.updated_at <= ? ORDER BY o.job_id",
+                (before,),
+            )
+
+    def begin_send(self, job_id: int, *, now: float, per_hour: int, per_chat: int) -> SendVerdict:
+        """Check the caps and mark the reply's one POST as started, together.
+
+        `go` is returned at most once per reply, ever: the mark is a compare-and-set on a row that
+        is `delivering`, still a `send`, and has no POST behind it. Whatever happens to the
+        request afterwards, no code path starts a second one.
+        """
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT channel_id FROM outbox WHERE job_id = ? AND state = 'delivering' "
+                "AND mode = 'send' AND attempts = 0",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return "unconfirmed"
+            window = now - CAP_WINDOW_SECONDS
+            total = connection.execute(
+                f"SELECT COUNT(*) {COUNTED_SENDS}",
+                (window,),
+            ).fetchone()[0]
+            if total >= per_hour:
+                return "cap"
+            chat = connection.execute(
+                f"SELECT COUNT(*) {COUNTED_SENDS} AND channel_id = ?",
+                (window, row[0]),
+            ).fetchone()[0]
+            if chat >= per_chat:
+                return "chat_cap"
+            connection.execute(
+                "UPDATE outbox SET attempts = 1, updated_at = ? WHERE job_id = ?", (now, job_id)
+            )
+            return "go"
+
+    def downgrade_outbox(
+        self, job_id: int, downgrade: str, now: float, *, requeue: bool = False
+    ) -> None:
+        """Turn a direct reply into a draft, for good, and record which check did it.
+
+        No method turns a draft back into a send. `requeue` also puts the row back to `pending`.
+        """
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE outbox SET mode = 'draft', downgrade = ?, updated_at = ?, "
+                "state = CASE WHEN ? THEN 'pending' ELSE state END "
+                "WHERE job_id = ? AND mode = 'send' AND state != 'done'",
+                (downgrade, now, requeue, job_id),
+            )
+            connection.execute(
+                "UPDATE jobs SET reply_mode = (SELECT mode FROM outbox WHERE job_id = jobs.id) "
+                "WHERE id = ?",
+                (job_id,),
+            )
+
+    def postpone_outbox(self, job_id: int, *, reason: str, retry_at: float, now: float) -> bool:
+        """Put a taken reply back to wait until `retry_at`, and return whether `reason` is news.
+
+        The caller logs the wait only when it is news, so a chat that stays busy is one log line.
+        """
+        with self._transaction() as connection:
+            previous = connection.execute(
+                "SELECT reason FROM outbox WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            connection.execute(
+                "UPDATE outbox SET state = 'pending', reason = ?, retry_at = ?, updated_at = ? "
+                "WHERE job_id = ? AND state = 'delivering'",
+                (reason, retry_at, now, job_id),
+            )
+        return previous is None or previous[0] != reason
+
+    def finish_outbox(
+        self,
+        job_id: int,
+        *,
+        outcome: Delivery,
+        now: float,
+        post_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Record what became of a reply, on its row and on its job, together.
+
+        The text is emptied once it is in Mattermost or no longer wanted there, and the WAL is
+        emptied after it. A reply that failed keeps its text for the `drafts` command.
+        """
+        keep = outcome in KEPT_TEXT
+        with self._transaction() as connection:
+            finished = connection.execute(
+                "UPDATE outbox SET state = 'done', outcome = ?, post_id = ?, reason = ?, "
+                "retry_at = NULL, message = CASE WHEN ? THEN message ELSE NULL END, "
+                "updated_at = ? WHERE job_id = ? AND state != 'done'",
+                (outcome, post_id, reason, keep, now, job_id),
+            ).rowcount
+            if finished:
+                connection.execute(
+                    "UPDATE jobs SET delivery = ?, updated_at = ?, "
+                    "reply_mode = (SELECT mode FROM outbox WHERE job_id = jobs.id) WHERE id = ?",
+                    (outcome, now, job_id),
+                )
+        if finished and not keep:
+            self._checkpoint()
+
+    def expire_outbox(self, now: float) -> list[OutboxRow]:
+        """Give up on every reply still waiting after DRAFT_RETENTION_SECONDS, and return them.
+
+        The text stays for the `drafts` command until the job is pruned.
+        """
+        cutoff = now - DRAFT_RETENTION_SECONDS
+        with self._transaction() as connection:
+            expired = [
+                item.row
+                for item in _outgoing(
+                    connection, "WHERE o.state = 'pending' AND o.created_at < ?", (cutoff,)
+                )
+            ]
+            for row in expired:
+                connection.execute(
+                    "UPDATE outbox SET state = 'done', outcome = 'expired', retry_at = NULL, "
+                    "updated_at = ? WHERE job_id = ?",
+                    (now, row.job_id),
+                )
+                connection.execute(
+                    "UPDATE jobs SET delivery = 'expired', updated_at = ? WHERE id = ?",
+                    (now, row.job_id),
+                )
+        return expired
 
     def set_failed(
         self, job_id: int, *, reason: FailReason, now: float, backend: str | None = None

@@ -3,7 +3,9 @@ show or change the queue on the terminal.
 
 The processor's modules are imported only by the commands that need them: the listener's image
 does not ship LangGraph, and the processor's own modules never import the Mattermost client.
-Errors are shown as one line. A traceback could quote the data that caused it.
+The listener is the only process that holds the token, so it is also the one that delivers the
+processor's replies. Errors are shown as one line. A traceback could quote the data that caused
+it.
 """
 
 import asyncio
@@ -12,6 +14,7 @@ import re
 import sys
 
 from mattermost_agent.app import HEARTBEAT_FILE, Runtime, healthcheck, serve
+from mattermost_agent.deliver import Deliverer, build
 from mattermost_agent.jobs import show_jobs, show_outbox
 from mattermost_agent.logs import configure_logging, log_lifecycle
 from mattermost_agent.mattermost import (
@@ -68,6 +71,13 @@ def _command(arguments: list[str]) -> int | None:
     raise SystemExit(USAGE)
 
 
+async def _serve(runtime: Runtime, deliverer: Deliverer) -> None:
+    try:
+        await serve(runtime)
+    finally:
+        await deliverer.aclose()
+
+
 def _listen() -> None:
     try:
         settings = load_settings(os.environ)
@@ -78,15 +88,17 @@ def _listen() -> None:
         raise SystemExit(f"mattermost-agent: {error}") from None
 
     events_url = websocket_url(settings.mm_url)
+    deliverer = build(settings.mm_url, settings.token, allow_send=settings.allow_send)
     runtime = Runtime(
         client=MattermostClient(settings.mm_url, settings.token),
         store=store,
         rules=rules,
         connect_events=lambda: open_events(events_url, settings.token),
         heartbeat_file=settings.state_dir / HEARTBEAT_FILE,
+        deliver=deliverer.run,
     )
     try:
-        asyncio.run(serve(runtime))
+        asyncio.run(_serve(runtime, deliverer))
     except MattermostError as error:
         log_lifecycle("fatal", reason=error.reason, status=error.status, error=error.__cause__)
         raise SystemExit(f"mattermost-agent: {error}") from None

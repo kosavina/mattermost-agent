@@ -1,7 +1,8 @@
-"""The only code that talks to the Mattermost server.
+"""The code that reads from the Mattermost server.
 
-Every REST call here is a GET, and the WebSocket is only ever read from, so the listener has no
-way to post. The token goes only to the configured server: redirects are refused on both paths,
+Every REST call here is a GET, and the WebSocket is only ever read from, so nothing in this
+module can post. The few calls that write are in mattermost_write.py, which only deliver.py may
+import. The token goes only to the configured server: redirects are refused on both paths,
 because following one could carry the token to another host, and proxy settings in the
 environment are ignored.
 

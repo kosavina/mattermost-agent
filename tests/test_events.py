@@ -5,13 +5,17 @@ import pytest
 from helpers import make_post, posted_event, raw_post
 
 from mattermost_agent.events import (
+    AGENT_PROP,
     Channel,
+    ChatDraft,
     MalformedEvent,
     Me,
     dm_partner,
     is_hello,
     parse_channel,
     parse_channel_list,
+    parse_created_post,
+    parse_drafts,
     parse_post_page,
     parse_user,
     parse_websocket_message,
@@ -214,3 +218,91 @@ def test_malformed_rest_page_is_refused(body: object) -> None:
 )
 def test_dm_partner(name: str, partner: str | None) -> None:
     assert dm_partner(name, "me") == partner
+
+
+def page_of(post: dict[str, Any]) -> dict[str, Any]:
+    return {"order": [post["id"]], "posts": {post["id"]: post}}
+
+
+def test_our_marker_is_read_from_a_live_post_and_from_a_fetched_one() -> None:
+    """The server adds from_pat to posts made with a token; only our own key counts."""
+    marked = raw_post(props={AGENT_PROP: True, "from_pat": "true"})
+    assert parse(posted_event(marked)).from_agent is True
+    assert parse_post_page(page_of(marked), CHANNEL)[0].from_agent is True
+
+
+@pytest.mark.parametrize(
+    "props",
+    [
+        {},
+        {"from_pat": "true"},
+        {AGENT_PROP: "true"},
+        {AGENT_PROP: 1},
+        {AGENT_PROP: False},
+        {AGENT_PROP: None},
+        {AGENT_PROP: [True]},
+        {"FROM_MATTERMOST_AGENT": True},
+        None,
+        "text",
+        [AGENT_PROP],
+        7,
+    ],
+)
+def test_only_the_json_value_true_is_our_marker(props: object) -> None:
+    """Props of another shape are not an error: the post is read as usual, without the marker."""
+    post = raw_post(props=props)
+    assert parse(posted_event(post)).from_agent is False
+    assert parse_post_page(page_of(post), CHANNEL)[0].from_agent is False
+
+
+def test_a_post_without_props_has_no_marker() -> None:
+    assert parse(posted_event(raw_post())).from_agent is False
+    assert make_post().from_agent is False
+
+
+def test_props_are_not_kept() -> None:
+    post = parse(posted_event(raw_post(props={AGENT_PROP: True, "note": SECRET})))
+    assert SECRET not in repr(post) and not hasattr(post, "props")
+
+
+def test_channel_row_with_its_team() -> None:
+    row = {"id": "c", "name": "general", "type": "O", "last_post_at": 9, "team_id": "team-1"}
+    assert parse_channel(row).team_id == "team-1"
+    assert parse_channel({"id": "d", "name": "a__b", "type": "D", "team_id": ""}).team_id == ""
+    assert parse_channel({"id": "d", "name": "a__b", "type": "D"}).team_id == ""
+
+
+def test_draft_listing() -> None:
+    rows = [
+        {"channel_id": "c", "root_id": "", "message": SECRET, "props": {}, "user_id": "u"},
+        {"channel_id": "c", "root_id": "root-1", "message": ""},
+        {"channel_id": "d"},
+    ]
+    drafts = parse_drafts(rows)
+    assert drafts == [
+        ChatDraft("c", "", SECRET),
+        ChatDraft("c", "root-1", ""),
+        ChatDraft("d", "", ""),
+    ]
+    assert SECRET not in repr(drafts)
+    assert parse_drafts([]) == []
+    assert parse_drafts(None) == []  # what the real server sends for "no drafts"
+
+
+@pytest.mark.parametrize(
+    "body", [{}, "text", 0, [[]], [{"root_id": ""}], [{"channel_id": "c", "message": 7}]]
+)
+def test_malformed_draft_listing_is_refused_without_quoting_it(body: object) -> None:
+    with pytest.raises(MalformedEvent) as error:
+        parse_drafts(body)
+    assert "7" not in str(error.value)
+
+
+def test_created_post() -> None:
+    assert parse_created_post({"id": "new-post", "message": SECRET}) == "new-post"
+
+
+@pytest.mark.parametrize("body", [{}, [], None, {"id": ""}, {"id": 7}])
+def test_malformed_created_post_is_refused(body: object) -> None:
+    with pytest.raises(MalformedEvent):
+        parse_created_post(body)

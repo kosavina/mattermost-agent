@@ -10,6 +10,9 @@ services:
       MM_URL: ${MM_URL:?set MM_URL in .env}
       MM_TOKEN_FILE: /run/secrets/mm_token
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # The kill switch for direct sending. Only ALLOW_SEND=1 in .env lets a `send` rule post;
+      # without it every such reply becomes a draft.
+      ALLOW_SEND: ${ALLOW_SEND:-}
     secrets: [mm_token]
     # No ports: on purpose. The listener only makes outgoing connections.
     read_only: true
