@@ -1,8 +1,8 @@
 # mattermost-agent
 
-A personal agent for your Mattermost account, in two processes. The **listener** watches for new posts, checks each one against your rules, groups matching posts into bursts, and queues each burst as a job. The **processor** takes each job, runs a locked-down AI coding agent (Codex or Claude Code) on it, and turns the answer into one of three outcomes: nothing, a new memory for that conversation, or a draft reply that waits for your approval on the terminal.
+A personal agent for your Mattermost account, in two processes. The **listener** watches for new posts, checks each one against your rules, groups matching posts into bursts, and queues each burst as a job. The **processor** takes each job, runs a locked-down AI coding agent (Codex or Claude Code) on it, and turns the answer into one of three outcomes: nothing, a new memory for that conversation, or a reply. The listener, which alone holds the token, delivers the reply: by default as a draft in that chat's message box, which you read, edit and send yourself.
 
-This is still a dry run towards Mattermost: nothing is ever posted. Approving a draft records the approval and stops there.
+Nothing is posted in your name unless you ask for it twice: a rule marked `reply: send` that names its senders, and `ALLOW_SEND=1` on the listener. Without both, every reply is a draft.
 
 **What it does**
 
@@ -18,7 +18,7 @@ This is still a dry run towards Mattermost: nothing is ever posted. Approving a 
 
 **What it does not do**
 
-- It never posts, reacts or changes anything in Mattermost. It only reads. An approved draft is recorded, not sent.
+- It writes to Mattermost in two ways only: a draft in a message box, never over a draft that is already there, and, for `send` rules with `ALLOW_SEND=1`, a labelled post. It never reacts, edits or deletes. The agent itself never touches Mattermost; it only returns text.
 - The agent holds no token and has no network: it can only read the folders it was given.
 - It keeps the text of matched posts only, in its own database, for 7 days, and a conversation's memory until you forget it. Of every other post it keeps just the id.
 
@@ -101,7 +101,7 @@ A rule may also set `reply`, which says what happens to the agent's reply:
 | `draft` | the reply is put into that chat's message box as a Mattermost draft | you |
 | `send` | the reply is posted at once with a label, if every check passes; otherwise it becomes a draft. The rule must list its senders in `from` | the listener |
 
-A rule without `reply` uses `replies.default`, which is `draft` unless the file says otherwise. Delivery to Mattermost is not built yet. Until it is, a `draft` or `send` reply waits in the processor's outbox, where `mattermost-agent drafts` shows it with its text and `mattermost-agent outbox` without; set `replies.default: local` to keep approving on the terminal.
+A rule without `reply` uses `replies.default`, which is `draft` unless the file says otherwise. A reply bound for Mattermost waits in the outbox until the listener delivers it, usually within seconds; `mattermost-agent outbox` shows what became of each one.
 
 The file ends with two more sections, both required:
 
@@ -142,7 +142,7 @@ People write a request as several short messages. A **burst** is the matching po
 - Timing uses the listener's clock when it handles the post, so posts fetched during catch-up are grouped as well.
 - A job and its posts are deleted 7 days after the job opened, whatever its status. The text is overwritten in the database file at that point.
 
-The processor will move a job on through `running`, `waiting_approval`, `done` and `failed`; the listener never touches a job after `ready`.
+The processor will move a job on through `running`, `waiting_approval`, `done` and `failed`; the listener never touches a job after `ready`, except to record how its reply was delivered.
 
 **Where the state lives.** The database and the heartbeat are in the Docker volume `agent_data`. If you set `STATE_DIR` yourself, point it at a local disk, never at a network share or a VM shared folder (such as `/Volumes/My Shared Files` on a Mac): the listener and the `jobs` command share one SQLite file in WAL mode, which needs a local file system.
 
@@ -224,7 +224,7 @@ They check, with the exact command the adapters build, that each agent cannot re
 ## Security model
 
 1. The token grants everything your account can do, so it lives only in a Docker secret file, never in `.env`, the image or `docker inspect`.
-2. The code has no way to write to Mattermost: it sends only GET requests, and a test enforces that.
+2. One module writes to Mattermost, `mattermost_write.py`, with three calls: list drafts, put a draft, create a post. Only `deliver.py` may import it, and tests enforce both that and that the reading client sends only GET requests. Without `ALLOW_SEND=1` the writer cannot create a post whatever the code above it does.
 3. Logs have no field for message text, tokens or headers, and errors are logged by class name only. Message text exists in one place only: the `job_posts` table of the database, for matched posts, for 7 days. The database and its side files are readable by the listener's user alone (mode 600), and deleted text is overwritten rather than left in free space.
 4. It connects only to your `https://` server: plain HTTP, proxies and redirects are refused, so the token cannot be sent anywhere else.
 5. The container runs as a non-root user with a read-only filesystem, no Linux capabilities and no open ports.
@@ -319,7 +319,7 @@ event=job_done   job=12 status=waiting_approval fail_reason=null
 - **First run.** It starts from now and does not read old posts.
 - **Long outages.** Catch-up goes back at most 30 days.
 - **Rules** are read at startup, so a change needs a restart.
-- **Approval on the terminal only.** Drafts are shown and decided with `drafts`, `approve` and `reject`; nothing is sent to Mattermost yet, and the listener does not yet know the agent's own posts.
+- **Text typed in the last seconds.** A draft is never written over one the server knows, and your app syncs what you type within seconds. Text typed in the very seconds before a reply arrives is not on the server yet, and the reply replaces it in the message box.
 - **Claude Code uses your own login.** Until it gets a separate config folder and token, every run reads your Keychain login and rewrites `~/.claude.json` (with a backup under `~/.claude/backups/`). It leaves no transcript and no memory. Codex uses the separate `~/agent/codex-home`.
 - **A `kill -9` during a run** leaves the agent to finish or time out on its own; the next start removes its temp folder and runs the job once more.
 - **Mac only, natively.** The agents' confinement is verified on macOS. A container for the processor, and a container wall around both, are the next milestone.
