@@ -70,7 +70,7 @@ class FakeBackend:
 
 
 def answer(decision: str, memory: str | None = None, draft: str | None = None) -> dict[str, object]:
-    return {"decision": decision, "memory": memory, "draft": draft}
+    return {"decision": decision, "memory": memory, "draft": draft, "needs_review": False}
 
 
 @dataclass

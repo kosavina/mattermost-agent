@@ -53,7 +53,7 @@ def main(arguments: list[str]) -> int:
         scenario_dir=folder,
         read_dirs=(),
         instructions=(folder / INSTRUCTIONS_FILE).read_text(encoding="utf-8"),
-        prompt=build_prompt(posts, None, "example.user"),
+        prompt=build_prompt(posts, None, "example.user", mode="draft"),
         timeout_s=settings.timeout_s,
     )
     try:
@@ -62,7 +62,7 @@ def main(arguments: list[str]) -> int:
     except AgentError as error:
         raise SystemExit(f"demo: the agent run failed: {error.reason}") from None
     print(f"backend={result.backend} duration_s={result.duration_s:.1f} denials={result.denials}")
-    shown = {k: None if v is None else safe_text(v) for k, v in answer.model_dump().items()}
+    shown = {k: safe_text(v) if isinstance(v, str) else v for k, v in answer.model_dump().items()}
     print(json.dumps(shown, indent=2, ensure_ascii=False))
     return 0
 

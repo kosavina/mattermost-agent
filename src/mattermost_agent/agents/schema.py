@@ -2,11 +2,14 @@
 
 The schema is fixed in code, not per scenario. It is strict: every key required, null instead of
 missing, no extra keys. AgentAnswer then checks that the texts fit the decision and the limits.
+
+`needs_review` is the agent asking for Kirill's eyes on a reply that could otherwise be posted
+directly. It can only make delivery safer, and it matters only for `act`.
 """
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError, model_validator
 
 from mattermost_agent.agents.port import AgentError
 
@@ -18,11 +21,12 @@ type Decision = Literal["ignore", "remember", "act"]
 OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["decision", "memory", "draft"],
+    "required": ["decision", "memory", "draft", "needs_review"],
     "properties": {
         "decision": {"type": "string", "enum": list(DECISIONS)},
         "memory": {"type": ["string", "null"]},
         "draft": {"type": ["string", "null"]},
+        "needs_review": {"type": "boolean"},
     },
 }
 
@@ -35,6 +39,8 @@ class AgentAnswer(BaseModel):
     decision: Decision
     memory: str | None
     draft: str | None
+    # Strict: "false" or 0 must not pass as a decision about review.
+    needs_review: StrictBool
 
     @model_validator(mode="after")
     def _texts_fit_the_decision(self) -> AgentAnswer:

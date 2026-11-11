@@ -99,6 +99,7 @@ def _decide(runtime: ProcessorRuntime) -> Node:
                 runtime.store.posts(job.id),
                 memory_files.read_memory(resolved.conversation_dir),
                 job.sender or UNKNOWN_SENDER,
+                mode=resolved.reply,
             ),
             timeout_s=runtime.timeout_s,
         )
