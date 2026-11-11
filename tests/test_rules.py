@@ -280,3 +280,29 @@ def test_binary_file_is_refused(tmp_path: Path) -> None:
     path.write_bytes(b"\xff\xfe")
     with pytest.raises(RulesError, match="not UTF-8"):
         load_rules(path)
+
+
+def test_read_lists_project_folders() -> None:
+    rule_set = rules_of("name: r, dm: true, scenario: a, read: [sales-reports, dwh_docs2]")
+    assert rule_set.rules[0].read == ("sales-reports", "dwh_docs2")
+    assert rules_of("name: r, dm: true, scenario: a").rules[0].read == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("[]", "rule 1 read must be a list"),
+        ("sales", "rule 1 read must be a list"),
+        ("[Sales]", "rule 1 read must hold folder names"),
+        ("[../x]", "rule 1 read must hold folder names"),
+        ("[/abs]", "rule 1 read must hold folder names"),
+        ("[a/b]", "rule 1 read must hold folder names"),
+        ("[.hidden]", "rule 1 read must hold folder names"),
+        ("[-dash]", "rule 1 read must hold folder names"),
+        ("[a, a]", "rule 1 read names a folder twice"),
+        ("[1]", "rule 1 read item must be text"),
+    ],
+)
+def test_bad_read_lists_are_refused(value: str, message: str) -> None:
+    with pytest.raises(RulesError, match=message):
+        rules_of(f"name: r, dm: true, scenario: a, read: {value}")

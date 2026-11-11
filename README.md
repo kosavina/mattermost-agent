@@ -89,7 +89,7 @@ Rules are checked from top to bottom, and the first match wins. Every condition 
 | `channels` | a post in one of these channels, by the name in the channel's URL | `channels: [analytics]` |
 | `from` | a post by one of these usernames, without the `@`. Your own posts match only a rule that lists you here | `from: [example.user]` |
 
-Each rule also has a `name`, which the log and the queue show, and a `scenario`, a label for the processor.
+Each rule also has a `name`, which the log and the queue show, and a `scenario`, the processor's scenario for the job. A rule may add `read`, a list of project folder names under the agent root's `projects/` that the agent may read for that rule (one path segment each: letters, digits, `-` and `_`); without it, the agent sees only the scenario folder and the conversation's own memory.
 
 The file ends with two more sections, both required:
 
