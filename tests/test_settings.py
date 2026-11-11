@@ -19,6 +19,15 @@ def test_defaults() -> None:
     assert settings.rules_file == Path("/config/rules.yaml")
     assert settings.state_dir == Path("/data")
     assert settings.log_level == "INFO"
+    assert settings.allow_send is False
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), ("", False), ("0", False), ("true", False), ("yes", False), (" 1", False)],
+)
+def test_only_one_lets_the_listener_send(value: str, expected: bool) -> None:
+    assert load_settings(env(ALLOW_SEND=value)).allow_send is expected
 
 
 def test_values_are_read() -> None:

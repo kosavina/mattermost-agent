@@ -5,6 +5,7 @@ from helpers import make_post
 
 from mattermost_agent.rules import (
     Bursts,
+    Replies,
     RulesError,
     RuleSet,
     first_match,
@@ -259,7 +260,11 @@ def test_rules_are_loaded_from_a_file(tmp_path: Path) -> None:
 
 def test_the_shipped_example_file_is_valid() -> None:
     example = Path(__file__).parent.parent / "rules.example.yaml"
-    assert load_rules(example).channel_names == frozenset({"analytics"})
+    rule_set = load_rules(example)
+    assert rule_set.channel_names == frozenset({"analytics"})
+    # The example spells out the defaults, and shows one rule of each kind of reply it documents.
+    assert rule_set.replies == Replies()
+    assert [rule_set.reply_mode(rule) for rule in rule_set.rules] == ["draft", "draft", "send"]
 
 
 def test_missing_file_is_named(tmp_path: Path) -> None:
@@ -306,3 +311,114 @@ def test_read_lists_project_folders() -> None:
 def test_bad_read_lists_are_refused(value: str, message: str) -> None:
     with pytest.raises(RulesError, match=message):
         rules_of(f"name: r, dm: true, scenario: a, read: {value}")
+
+
+SEND_RULE = "name: r, dm: true, from: [example.user], scenario: a, reply: send"
+
+
+def test_without_a_replies_section_every_rule_drafts() -> None:
+    rule_set = rules_of("name: r, dm: true, scenario: a")
+    assert rule_set.replies == Replies()
+    assert rule_set.replies.default == "draft"
+    assert rule_set.rules[0].reply is None
+    assert rule_set.reply_mode(rule_set.rules[0]) == "draft"
+
+
+def test_a_rule_can_choose_its_own_reply_mode() -> None:
+    rule_set = rules_of(
+        "name: quiet, channels: [a], scenario: a, reply: local",
+        "name: plain, channels: [b], scenario: a",
+        SEND_RULE,
+        tail=LIMITS + BURSTS + "replies: {default: draft}\n",
+    )
+    assert [rule_set.reply_mode(rule) for rule in rule_set.rules] == ["local", "draft", "send"]
+
+
+def test_the_replies_section_is_read() -> None:
+    replies = (
+        "replies: {default: local, sends_per_hour: 9, sends_per_chat_per_hour: 3, "
+        'max_send_age_minutes: 10, label: "_From my assistant_"}\n'
+    )
+    rule_set = parse_rules(ONE_RULE + LIMITS + BURSTS + replies)
+    assert rule_set.replies == Replies("local", 9, 3, 10, "_From my assistant_")
+    assert rule_set.reply_mode(rule_set.rules[0]) == "local"
+
+
+def test_keys_left_out_of_replies_keep_their_defaults() -> None:
+    rule_set = parse_rules(ONE_RULE + LIMITS + BURSTS + "replies: {sends_per_hour: 1}\n")
+    assert rule_set.replies == Replies(sends_per_hour=1)
+
+
+@pytest.mark.parametrize("value", ["post", "Send", "true", "1", "[send]", "null", '""'])
+def test_bad_reply_modes_are_refused(value: str) -> None:
+    with pytest.raises(RulesError, match="rule 1 reply must be one of: local, draft, send"):
+        rules_of(f"name: r, dm: true, from: [example.user], scenario: a, reply: {value}")
+    with pytest.raises(RulesError, match="replies default must be one of: local, draft, send"):
+        parse_rules(ONE_RULE + LIMITS + BURSTS + f"replies: {{default: {value}}}\n")
+
+
+def test_a_send_rule_must_name_its_senders() -> None:
+    with pytest.raises(
+        RulesError, match="rule 2 replies with send, so it must name senders in from"
+    ):
+        rules_of(
+            "name: first, dm: true, scenario: a",
+            "name: second, channels: [analytics], scenario: a, reply: send",
+        )
+
+
+def test_a_send_default_needs_senders_on_every_rule_without_its_own_mode() -> None:
+    tail = LIMITS + BURSTS + "replies: {default: send}\n"
+    with pytest.raises(RulesError, match="rule 1 replies with send"):
+        rules_of("name: r, dm: true, scenario: a", tail=tail)
+    rule_set = rules_of(
+        "name: named, dm: true, from: [example.user], scenario: a",
+        "name: drafted, channels: [analytics], scenario: a, reply: draft",
+        tail=tail,
+    )
+    assert [rule_set.reply_mode(rule) for rule in rule_set.rules] == ["send", "draft"]
+
+
+@pytest.mark.parametrize(
+    "key", ["sends_per_hour", "sends_per_chat_per_hour", "max_send_age_minutes"]
+)
+@pytest.mark.parametrize("value", BAD_NUMBERS)
+def test_bad_reply_numbers_are_refused(key: str, value: str) -> None:
+    with pytest.raises(RulesError, match=f"replies {key} must be a whole number"):
+        parse_rules(ONE_RULE + LIMITS + BURSTS + f"replies: {{{key}: {value}}}\n")
+
+
+@pytest.mark.parametrize(
+    ("label", "message"),
+    [
+        ('""', "replies label must be text, and not empty"),
+        ('"   "', "replies label must be text, and not empty"),
+        ("7", "replies label must be text, and not empty"),
+        ("null", "replies label must be text, and not empty"),
+        (f'"{"x" * 201}"', "replies label must be one line of at most 200 characters"),
+        ('"one\\ntwo"', "replies label must be one line of at most 200 characters"),
+    ],
+)
+def test_bad_labels_are_refused(label: str, message: str) -> None:
+    with pytest.raises(RulesError, match=message):
+        parse_rules(ONE_RULE + LIMITS + BURSTS + f"replies: {{label: {label}}}\n")
+
+
+def test_the_longest_label_is_allowed() -> None:
+    replies = f'replies: {{label: "{"x" * 200}"}}\n'
+    assert len(parse_rules(ONE_RULE + LIMITS + BURSTS + replies).replies.label) == 200
+
+
+@pytest.mark.parametrize("replies", ["replies: 5\n", "replies: []\n", "replies: {other: 1}\n"])
+def test_a_bad_replies_section_is_refused(replies: str) -> None:
+    with pytest.raises(RulesError, match="replies"):
+        parse_rules(ONE_RULE + LIMITS + BURSTS + replies)
+
+
+def test_reply_errors_do_not_quote_the_file() -> None:
+    with pytest.raises(RulesError) as error:
+        rules_of("name: r, dm: true, scenario: a, reply: sentinel-private-mode")
+    assert "sentinel-private-mode" not in str(error.value)
+    with pytest.raises(RulesError) as error:
+        parse_rules(ONE_RULE + LIMITS + BURSTS + f'replies: {{label: "{"sentinel" * 30}"}}\n')
+    assert "sentinel" not in str(error.value)
