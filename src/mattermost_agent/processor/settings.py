@@ -143,10 +143,12 @@ def _roots(agent_root: Path) -> Roots:
     for root in roots:
         if not inside(root, agent_root) or root == agent_root:
             raise SettingsError("a folder under AGENT_ROOT points outside it (a symlink?)")
-    # Disjoint, or a project could contain every conversation (conversations -> projects/x/c).
-    for root in roots:
-        if any(other != root and inside(root, other) for other in roots):
-            raise SettingsError("the folders under AGENT_ROOT overlap (a symlink?)")
+    # Disjoint, or a project could contain every conversation (conversations -> projects/x/c),
+    # and distinct, or a scenario could be a conversation (conversations -> scenarios).
+    if len(set(roots)) != 3 or any(
+        inside(root, other) for root in roots for other in roots if other != root
+    ):
+        raise SettingsError("the folders under AGENT_ROOT overlap (a symlink?)")
     return roots
 
 
@@ -162,11 +164,10 @@ def load_processor_settings(env: Mapping[str, str]) -> ProcessorSettings:
     state_dir = _local_path(env, "STATE_DIR")
     agent_root = _local_path(env, "AGENT_ROOT")
     roots = _roots(agent_root)
+    # Resolved in both cases: the default could be a symlink to a shared volume or into a root.
     codex_home = (
-        Path(env["CODEX_HOME"]).expanduser().resolve()
-        if env.get("CODEX_HOME")
-        else agent_root / "codex-home"
-    )
+        Path(env["CODEX_HOME"]).expanduser() if env.get("CODEX_HOME") else agent_root / "codex-home"
+    ).resolve()
     if inside(codex_home, SHARED_VOLUMES):
         raise SettingsError("CODEX_HOME is on a shared volume; it must be on the local disk")
     for name, folder in (("STATE_DIR", state_dir), ("CODEX_HOME", codex_home)):

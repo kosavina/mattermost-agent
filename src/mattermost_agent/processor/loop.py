@@ -3,17 +3,23 @@
 One worker. A job is taken with a compare-and-set, run to its end or to its approval pause, and
 its status written from what the graph returned: an interrupt means `waiting_approval`, a final
 state `done`, an exception `failed` with a reason. A finished job's checkpoint thread is deleted
-at once. At startup, jobs left in `running` by a crash are continued with invoke(None). Hourly,
+at once. At startup, jobs left in `running` by a crash are continued with invoke(None), or started
+from the beginning if the crash came before their first checkpoint. Hourly,
 drafts older than three days expire and checkpoint threads whose job is gone are deleted.
+
+Only one processor may run per state folder: `processor.lock` there is held with flock for the
+whole run, so that a second one cannot resume the jobs the first still owns or clear its tmp/.
 
 Ctrl+C or SIGTERM kills the agent run in progress with its process group and stops the loop; the
 job stays `running` and is continued at the next start.
 """
 
+import fcntl
 import os
 import signal
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from types import FrameType
 
 from mattermost_agent.agents import AgentError, BackendCheckError
@@ -29,6 +35,9 @@ from mattermost_agent.settings import SettingsError
 from mattermost_agent.store import FILE_NAME, FailReason, Store, StoreError
 
 HOUSEKEEPING_SECONDS = 3600.0
+LOCK_FILE = "processor.lock"
+# The lock's descriptor, kept open so that the lock lasts as long as the process.
+_lock: int | None = None
 AGENT_FAIL_REASONS: dict[str, FailReason] = {
     "exit": "agent_failed",
     "denied_startup": "agent_failed",
@@ -36,6 +45,27 @@ AGENT_FAIL_REASONS: dict[str, FailReason] = {
     "invalid_json": "invalid_output",
     "invalid_output": "invalid_output",
 }
+
+
+def hold_lock(state_dir: Path) -> None:
+    """Take the processor's lock for this process, or raise SettingsError if another holds it."""
+    global _lock
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(state_dir / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        raise SettingsError("another processor is running on this STATE_DIR") from None
+    _lock = descriptor
+
+
+def release_lock() -> None:
+    """Drop the lock (tests run more than one processor in a process; exit does it otherwise)."""
+    global _lock
+    if _lock is not None:
+        os.close(_lock)
+        _lock = None
 
 
 class Stop(BaseException):
@@ -55,8 +85,18 @@ class Processor:
         self.last_housekeeping: float | None = None
 
     def run_job(self, job_id: int, resume: bool = False) -> None:
-        """Invoke the graph for one job (from the start, or continuing after a crash) and record."""
+        """Invoke the graph for one job (from the start, or continuing after a crash) and record.
+
+        A job taken by a processor that died before its first checkpoint has no thread to
+        continue: it is started from the beginning, if it is still `running` (the approve command
+        may have finished it, and deleted its thread, since the sweep listed it).
+        """
         store, now = self.runtime.store, self.runtime.clock
+        if resume and self.runtime.checkpointer.get_tuple(thread(job_id)) is None:
+            job = store.job(job_id)
+            if job is None or job.status != "running":
+                return
+            resume = False
         try:
             result = self.graph.invoke(None if resume else {"job_id": job_id}, thread(job_id))
         except AgentError as error:
@@ -164,6 +204,7 @@ def main(env: Mapping[str, str]) -> int:
         settings = load_processor_settings(env)
         configure_logging(settings.log_level)
         os.umask(0o077)
+        hold_lock(settings.state_dir)
         clear_stale_tmp(settings.state_dir)
         processor = start(settings)
     except (SettingsError, RulesError, ScenariosError, BackendCheckError, StoreError) as error:

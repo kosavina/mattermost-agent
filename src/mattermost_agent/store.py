@@ -469,11 +469,15 @@ class Store:
     def set_waiting(
         self, job_id: int, *, backend: str, decision: str, draft: str, now: float
     ) -> None:
-        """Record the agent's draft and wait for approval."""
+        """Record the agent's draft and wait for approval.
+
+        Only a `running` job can start waiting: a startup sweep that resumes a paused thread must
+        not undo an approval the terminal command finished first.
+        """
         with self._transaction() as connection:
             connection.execute(
                 "UPDATE jobs SET status = 'waiting_approval', backend = ?, decision = ?, "
-                "draft = ?, updated_at = ? WHERE id = ?",
+                "draft = ?, updated_at = ? WHERE id = ? AND status = 'running'",
                 (backend, decision, draft, now, job_id),
             )
 

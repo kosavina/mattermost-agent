@@ -225,6 +225,16 @@ def test_the_act_path(store: Store, path: Path) -> None:
     assert query(path, "SELECT draft FROM jobs") == [(CANARY,)]
 
 
+def test_set_waiting_touches_only_a_running_job(store: Store, path: Path) -> None:
+    """A startup sweep must not undo an approval the terminal command finished first."""
+    job = ready_job(store)
+    store.take_ready(NOW)
+    store.set_done(job.id, now=NOW + 1, backend="codex", decision="act", approval="approved")
+    store.set_waiting(job.id, backend="codex", decision="act", draft=CANARY, now=NOW + 2)
+    assert read_jobs(path)[0].status == "done"
+    assert read_drafts(path) == []
+
+
 def test_the_ignore_path(store: Store, path: Path) -> None:
     job = ready_job(store)
     store.take_ready(NOW)

@@ -36,23 +36,30 @@ def _fsync_dir(path: Path) -> None:
         os.close(descriptor)
 
 
-def _archive_name(history: Path, written_ns: int) -> Path:
-    """Return history/<unix-ms>.md for a file written at `written_ns`, free of collisions."""
-    stem = str(written_ns // 1_000_000)
+def _archive(history: Path, current: Path) -> None:
+    """Hard-link the current file into history/ as <unix-ms>.md, named by when it was written.
+
+    A crash between this link and the rename leaves the link in place; the rerun finds it (same
+    inode) and adds nothing. Another file of that name is a collision, and gets a suffix.
+    """
+    stem = str(current.stat().st_mtime_ns // 1_000_000)
     candidate = history / f"{stem}.md"
     counter = 1
     while candidate.exists():
+        if candidate.samefile(current):
+            return
         candidate = history / f"{stem}-{counter}.md"
         counter += 1
-    return candidate
+    os.link(current, candidate)
+    _fsync_dir(history)
 
 
 def save_memory(conversation_dir: Path, text: str) -> int | None:
     """Make `text` the current memory and return its version number, or None if it already is.
 
     Idempotent: a crash and a rerun with the same text adds no history entry. The new text is
-    written to a temp file and fsynced; the old file moves into history/; then the temp file is
-    renamed into place, so memory.md is always complete.
+    written to a temp file and fsynced; the old file is hard-linked into history/; then the temp
+    file is renamed over memory.md, which is therefore present and complete at every instant.
     """
     current = conversation_dir / MEMORY_FILE
     if read_memory(conversation_dir) == text:
@@ -65,7 +72,7 @@ def save_memory(conversation_dir: Path, text: str) -> int | None:
     history = conversation_dir / HISTORY_DIR
     if current.exists():
         history.mkdir(mode=0o700, exist_ok=True)
-        os.replace(current, _archive_name(history, current.stat().st_mtime_ns))
+        _archive(history, current)
     os.replace(temp, current)
     _fsync_dir(conversation_dir)
     return memory_versions(conversation_dir) + 1

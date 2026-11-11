@@ -145,6 +145,12 @@ def test_overlapping_roots_are_refused(root: Path) -> None:
         load_processor_settings(env(root))
 
 
+def test_two_roots_resolving_to_the_same_folder_are_refused(root: Path) -> None:
+    (root / "conversations").symlink_to(root / "scenarios")
+    with pytest.raises(SettingsError, match="overlap"):
+        load_processor_settings(env(root))
+
+
 def test_a_dangling_root_symlink_is_refused_without_a_path(root: Path) -> None:
     (root / "projects").symlink_to(root / "nonexistent")
     with pytest.raises(SettingsError, match="cannot create or open") as info:
@@ -160,6 +166,13 @@ def test_state_dir_inside_a_read_root_is_refused(root: Path) -> None:
 def test_codex_home_inside_a_read_root_is_refused(root: Path) -> None:
     with pytest.raises(SettingsError, match="CODEX_HOME is inside a folder the agents may read"):
         load_processor_settings(env(root, CODEX_HOME=str(root / "projects" / "codex")))
+
+
+def test_the_default_codex_home_is_resolved_before_the_checks(root: Path) -> None:
+    (root / "projects" / "ch").mkdir(parents=True)
+    (root / "codex-home").symlink_to(root / "projects" / "ch")
+    with pytest.raises(SettingsError, match="CODEX_HOME is inside a folder the agents may read"):
+        load_processor_settings(env(root))
 
 
 def test_errors_never_quote_values(root: Path) -> None:
