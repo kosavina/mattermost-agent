@@ -3,7 +3,8 @@
 The parameters of the log_* functions are the allow-list of what can be logged. None has a
 parameter for message text, a memory, a draft, a prompt, a token or a header, so calling code has
 no way to pass them. Of an agent run, only the backend, the decision, the duration, the attempt
-and the number of refused tool calls are logged.
+and the number of refused tool calls are logged; of a reply, only how it will be delivered and
+its length.
 """
 
 import json
@@ -208,4 +209,23 @@ def log_job_done(*, job_id: int, status: JobStatus, fail_reason: FailReason | No
         job_id,
         status,
         fail_reason or NO_VALUE,
+    )
+
+
+def log_reply_planned(
+    *, job_id: int, mode: str, downgrade: str | None, outcome: str, chars: int
+) -> None:
+    """Write the one line for a reply handed to the outbox: how it goes out, and its length.
+
+    `downgrade` names the check that turned a direct reply into a draft, and `outcome` is
+    `queued`, or `refused_command` for a reply that must reach no message box.
+    """
+    logger.info(
+        "event=%-10s job=%-5d mode=%-5s downgrade=%-12s outcome=%-16s chars=%d",
+        "reply_planned",
+        job_id,
+        mode,
+        downgrade or NO_VALUE,
+        outcome,
+        chars,
     )

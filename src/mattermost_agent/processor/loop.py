@@ -2,10 +2,12 @@
 
 One worker. A job is taken with a compare-and-set, run to its end or to its approval pause, and
 its status written from what the graph returned: an interrupt means `waiting_approval`, a final
-state `done`, an exception `failed` with a reason. A finished job's checkpoint thread is deleted
+state `done`, an exception `failed` with a reason. A reply bound for Mattermost (reply mode
+`draft` or `send`) is planned here by our checks and queued in the outbox in the same transaction
+that finishes the job; the listener delivers it. A finished job's checkpoint thread is deleted
 at once. At startup, jobs left in `running` by a crash are continued with invoke(None), or started
 from the beginning if the crash came before their first checkpoint. Hourly,
-drafts older than three days expire and checkpoint threads whose job is gone are deleted.
+drafts older than three days expire and checkpoint threads no job needs any more are deleted.
 
 Only one processor may run per state folder: `processor.lock` there is held with flock for the
 whole run, so that a second one cannot resume the jobs the first still owns or clear its tmp/.
@@ -24,15 +26,21 @@ from types import FrameType
 
 from mattermost_agent.agents import AgentError, BackendCheckError
 from mattermost_agent.agents.locked_run import clear_stale_tmp, kill_running
-from mattermost_agent.logs import configure_logging, log_job_done, log_lifecycle
+from mattermost_agent.logs import (
+    configure_logging,
+    log_job_done,
+    log_lifecycle,
+    log_reply_planned,
+)
 from mattermost_agent.processor.checkpoints import forget_thread, open_checkpointer, thread_ids
 from mattermost_agent.processor.folders import JobSetupError
 from mattermost_agent.processor.graph import JobVanished, ProcessorRuntime, build_graph, thread
 from mattermost_agent.processor.scenarios import ScenariosError, load_scenarios, scenario_dir
 from mattermost_agent.processor.settings import ProcessorSettings, load_processor_settings
-from mattermost_agent.rules import RulesError, load_rules
+from mattermost_agent.replies import plan_reply
+from mattermost_agent.rules import DeliveryMode, RulesError, load_rules
 from mattermost_agent.settings import SettingsError
-from mattermost_agent.store import FILE_NAME, FailReason, Store, StoreError
+from mattermost_agent.store import FILE_NAME, QUEUED, FailReason, Store, StoreError
 
 HOUSEKEEPING_SECONDS = 3600.0
 LOCK_FILE = "processor.lock"
@@ -123,8 +131,55 @@ class Processor:
             )
             log_job_done(job_id=job_id, status="waiting_approval", fail_reason=None)
             return
+        mode = result.get("mode")
+        if decision == "act" and (mode == "draft" or mode == "send"):
+            self._queue_reply(job_id, mode, result)
+            return
         store.set_done(job_id, now=now(), backend=backend, decision=decision)
         forget_thread(self.runtime.checkpointer, job_id)
+        log_job_done(job_id=job_id, status="done", fail_reason=None)
+
+    def _queue_reply(self, job_id: int, mode: DeliveryMode, result: dict[str, object]) -> None:
+        """Plan the reply with our checks, then finish the job and queue the reply together.
+
+        The mode came from config through the graph's state; the agent's answer can only make it
+        safer. After a crash this runs again from the same final state and gives the same plan,
+        and the store then writes it once.
+        """
+        store = self.runtime.store
+        job, posts = store.job(job_id), store.posts(job_id)
+        if job is None or not posts:
+            forget_thread(self.runtime.checkpointer, job_id)
+            return
+        plan = plan_reply(
+            mode,
+            job,
+            posts[0],
+            str(result.get("draft") or ""),
+            needs_review=result.get("needs_review") is not False,
+        )
+        backend, decision = result.get("backend"), result.get("decision")
+        queued = store.finish_with_reply(
+            job_id,
+            mode=plan.mode,
+            root_id=plan.root_id,
+            message=plan.message,
+            downgrade=plan.downgrade,
+            refused=plan.refused,
+            backend=None if backend is None else str(backend),
+            decision=None if decision is None else str(decision),
+            now=self.runtime.clock(),
+        )
+        forget_thread(self.runtime.checkpointer, job_id)
+        if not queued:
+            return
+        log_reply_planned(
+            job_id=job_id,
+            mode=plan.mode,
+            downgrade=plan.downgrade,
+            outcome="refused_command" if plan.refused else QUEUED,
+            chars=len(plan.message),
+        )
         log_job_done(job_id=job_id, status="done", fail_reason=None)
 
     def _fail(self, job_id: int, reason: FailReason) -> None:
@@ -133,7 +188,11 @@ class Processor:
         log_job_done(job_id=job_id, status="failed", fail_reason=reason)
 
     def housekeeping(self) -> None:
-        """Expire old drafts and delete checkpoint threads whose job the listener pruned."""
+        """Expire old drafts and delete the checkpoint threads no job needs any more.
+
+        That is the thread of a job the listener pruned, and of a job that finished just before a
+        crash could delete its thread, which would otherwise keep the draft until the prune.
+        """
         now = self.runtime.clock()
         if (
             self.last_housekeeping is not None
@@ -151,7 +210,7 @@ class Processor:
             int(thread_id)
             for thread_id in thread_ids(self.runtime.checkpointer)
             if thread_id.isascii() and thread_id.isdigit()
-        } - self.runtime.store.job_ids()
+        } - self.runtime.store.unfinished_job_ids()
         for job_id in orphans:
             forget_thread(self.runtime.checkpointer, job_id)
         if orphans:

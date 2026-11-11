@@ -2,14 +2,17 @@
 
 It holds the ids of handled posts, the last-seen time, and the jobs: bursts of matched posts, with
 their text. Message text lives in job_posts.message and nowhere else, and only a post that matched
-a rule has a row there. The processor adds the agent's decision and draft to the job's row. Post
-times (create_at, last-seen) are the server's Unix milliseconds. `now` and the job times are this
-machine's Unix seconds.
+a rule has a row there. The processor adds the agent's decision to the job's row, and the agent's
+reply either to the same row (`draft`, for a reply that waits on the terminal) or to the outbox,
+where the listener picks it up to deliver it to Mattermost. Post times (create_at, last-seen,
+last_post_at) are the server's Unix milliseconds. `now` and the job times are this machine's Unix
+seconds.
 
 Every operation opens its own short connection, and the queries are tiny, so they run directly on
-the event loop. The `jobs` and `drafts` commands read the same file through read_jobs, read_job and
-read_drafts, read-only, while the listener and the processor run. The listener owns a job up to
-`ready`; the processor owns it from there (take_ready is the hand-over, a compare-and-set).
+the event loop. The `jobs`, `drafts` and `outbox` commands read the same file through the read_*
+functions, read-only, while the listener and the processor run. The listener owns a job up to
+`ready`; the processor owns it from there (take_ready is the hand-over, a compare-and-set). An
+outbox row goes the other way: the processor writes it, and the listener owns it from then on.
 """
 
 import os
@@ -22,10 +25,10 @@ from typing import Literal, NamedTuple, get_args
 
 from mattermost_agent.classify import Kind
 from mattermost_agent.events import Post
-from mattermost_agent.rules import Bursts, Rule
+from mattermost_agent.rules import Bursts, DeliveryMode, Rule
 
 FILE_NAME = "state.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
 # A draft nobody approved or rejected in this time fails as `expired`.
@@ -46,6 +49,36 @@ type FailReason = Literal[
 FAIL_REASONS: tuple[str, ...] = get_args(FailReason.__value__)
 type Approval = Literal["approved", "rejected"]
 APPROVALS: tuple[str, ...] = get_args(Approval.__value__)
+type OutboxState = Literal["pending", "delivering", "done"]
+# What became of a reply. A job's `delivery` is `queued` until its outbox row has one of these.
+type Delivery = Literal[
+    "drafted", "sent", "skipped_answered", "refused_command", "failed", "expired"
+]
+QUEUED = "queued"
+
+# The agent's reply on its way to Mattermost, one row per job. `message` is the third place with
+# text; the listener empties it once the reply is delivered. `root_id` is the thread the reply
+# goes into (empty: the chat itself) and `last_post_at` the burst's last post.
+OUTBOX_TABLE = """
+    CREATE TABLE outbox (
+        job_id INTEGER PRIMARY KEY REFERENCES jobs (id),
+        mode TEXT NOT NULL CHECK (mode IN ('draft', 'send')),
+        channel_id TEXT NOT NULL,
+        root_id TEXT NOT NULL,
+        last_post_at INTEGER NOT NULL,
+        message TEXT,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'delivering', 'done')),
+        outcome TEXT,
+        downgrade TEXT,
+        reason TEXT,
+        post_id TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        retry_at REAL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """
+OUTBOX_INDEX = "CREATE INDEX outbox_state ON outbox (state, created_at)"
 
 # The statuses after `ready` and the nullable columns from `sender` on belong to the processor.
 SCHEMA = (
@@ -85,7 +118,9 @@ SCHEMA = (
         draft TEXT,
         fail_reason TEXT,
         approval TEXT,
-        finished_at REAL
+        finished_at REAL,
+        reply_mode TEXT,
+        delivery TEXT
     )
     """,
     "CREATE UNIQUE INDEX jobs_one_collecting ON jobs (conversation_key) "
@@ -102,9 +137,12 @@ SCHEMA = (
     )
     """,
     "CREATE INDEX job_posts_job_id ON job_posts (job_id, create_at)",
+    OUTBOX_TABLE,
+    OUTBOX_INDEX,
 )
 # From one schema version to the next, each in one transaction. Version 2 → 3: the processor's
-# columns, all nullable, so the listener's rows need no values.
+# columns, all nullable, so the listener's rows need no values. Version 3 → 4: how a job's reply
+# is delivered, and the outbox.
 MIGRATIONS: dict[int, tuple[str, ...]] = {
     2: tuple(
         f"ALTER TABLE jobs ADD COLUMN {column}"
@@ -118,12 +156,25 @@ MIGRATIONS: dict[int, tuple[str, ...]] = {
             "finished_at REAL",
         )
     ),
+    3: (
+        "ALTER TABLE jobs ADD COLUMN reply_mode TEXT",
+        "ALTER TABLE jobs ADD COLUMN delivery TEXT",
+        OUTBOX_TABLE,
+        OUTBOX_INDEX,
+    ),
 }
 # In the order of Job's fields.
 JOB_COLUMNS = (
     "id, status, scenario, rule, place, post_count, opened_at, ready_at, deadline_at, "
-    "channel_id, sender, backend, decision, fail_reason, approval, finished_at, root_id"
+    "channel_id, sender, backend, decision, fail_reason, approval, finished_at, root_id, "
+    "reply_mode, delivery"
 )
+# In the order of OutboxRow's fields, for a query that names outbox `o` and jobs `j`.
+OUTBOX_COLUMNS = (
+    "o.job_id, o.mode, o.channel_id, o.root_id, o.last_post_at, o.state, o.outcome, o.downgrade, "
+    "o.reason, o.post_id, o.attempts, o.retry_at, o.created_at, o.updated_at, j.place"
+)
+OUTBOX_JOIN = "outbox o JOIN jobs j ON j.id = o.job_id"
 
 type Claim = Literal["duplicate", "unmatched", "cap_hit", "opened", "joined"]
 
@@ -153,6 +204,8 @@ class Job:
     approval: str | None = None
     finished_at: float | None = None
     root_id: str = ""
+    reply_mode: str | None = None
+    delivery: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +223,35 @@ class Draft:
     """A job waiting for approval, with its draft. repr() leaves out the text."""
 
     job: Job
+    text: str = field(repr=False)
+
+
+@dataclass(frozen=True)
+class OutboxRow:
+    """One reply on its way to Mattermost, without its text. `place` is its job's."""
+
+    job_id: int
+    mode: str
+    channel_id: str
+    root_id: str
+    last_post_at: int
+    state: str
+    outcome: str | None
+    downgrade: str | None
+    reason: str | None
+    post_id: str | None
+    attempts: int
+    retry_at: float | None
+    created_at: float
+    updated_at: float
+    place: str | None = None
+
+
+@dataclass(frozen=True)
+class Reply:
+    """An outbox row that still holds its text. repr() leaves out the text."""
+
+    row: OutboxRow
     text: str = field(repr=False)
 
 
@@ -458,9 +540,13 @@ class Store:
         with self._transaction() as connection:
             return _jobs(connection, "WHERE status = ? ORDER BY id", (status,))
 
-    def job_ids(self) -> set[int]:
+    def unfinished_job_ids(self) -> set[int]:
+        """Return the jobs a checkpoint thread may still be needed for: running or waiting."""
         with self._transaction() as connection:
-            return {row[0] for row in connection.execute("SELECT id FROM jobs")}
+            rows = connection.execute(
+                "SELECT id FROM jobs WHERE status IN ('running', 'waiting_approval')"
+            )
+            return {row[0] for row in rows}
 
     def posts(self, job_id: int) -> list[JobPost]:
         """Return the job's posts with their text, oldest first."""
@@ -500,6 +586,60 @@ class Store:
                 (backend, decision, approval, now, now, job_id),
             )
 
+    def finish_with_reply(
+        self,
+        job_id: int,
+        *,
+        mode: DeliveryMode,
+        root_id: str,
+        message: str,
+        downgrade: str | None,
+        refused: bool,
+        backend: str | None,
+        decision: str | None,
+        now: float,
+    ) -> bool:
+        """Finish a running job and queue its reply for the listener, together or not at all.
+
+        Return whether this call did it. Only a `running` job is finished, and a job has one
+        outbox row, so repeating the call after a crash changes nothing. A refused reply is
+        recorded as already done: it keeps its text for the `drafts` command and is never
+        delivered.
+        """
+        delivery = "refused_command" if refused else QUEUED
+        with self._transaction() as connection:
+            rows = connection.execute(
+                "UPDATE jobs SET status = 'done', backend = COALESCE(?, backend), "
+                "decision = COALESCE(?, decision), reply_mode = ?, delivery = ?, "
+                "finished_at = ?, updated_at = ? WHERE id = ? AND status = 'running' "
+                "RETURNING channel_id",
+                (backend, decision, mode, delivery, now, now, job_id),
+            ).fetchall()
+            if not rows:
+                return False
+            last_post_at = connection.execute(
+                "SELECT MAX(create_at) FROM job_posts WHERE job_id = ?", (job_id,)
+            ).fetchone()[0]
+            connection.execute(
+                "INSERT INTO outbox (job_id, mode, channel_id, root_id, last_post_at, message, "
+                "state, outcome, downgrade, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    mode,
+                    rows[0][0],
+                    root_id,
+                    last_post_at or 0,
+                    message,
+                    "done" if refused else "pending",
+                    "refused_command" if refused else None,
+                    downgrade,
+                    now,
+                    now,
+                ),
+            )
+        return True
+
     def set_failed(
         self, job_id: int, *, reason: FailReason, now: float, backend: str | None = None
     ) -> None:
@@ -526,7 +666,8 @@ class Store:
 
         Posts are forgotten once catch-up cannot reach them, measured from last-seen and not from
         today, so that a long outage cannot forget posts that the next catch-up will read again.
-        Jobs are forgotten 7 days after they opened, whatever their status.
+        Jobs are forgotten 7 days after they opened, whatever their status, and their posts and
+        outbox rows go with them.
         """
         with self._transaction() as connection:
             handled = connection.execute(
@@ -537,6 +678,10 @@ class Store:
             cutoff = now - JOB_RETENTION_SECONDS
             connection.execute(
                 "DELETE FROM job_posts WHERE job_id IN (SELECT id FROM jobs WHERE opened_at < ?)",
+                (cutoff,),
+            )
+            connection.execute(
+                "DELETE FROM outbox WHERE job_id IN (SELECT id FROM jobs WHERE opened_at < ?)",
                 (cutoff,),
             )
             jobs = connection.execute("DELETE FROM jobs WHERE opened_at < ?", (cutoff,)).rowcount
@@ -600,3 +745,25 @@ def read_drafts(path: Path) -> list[Draft]:
             "WHERE status = 'waiting_approval' ORDER BY id"
         )
         return [Draft(Job(*row[:-1]), row[-1] or "") for row in rows]
+
+
+def read_outbox(path: Path) -> list[OutboxRow]:
+    """Return every reply queued for Mattermost, newest first, without its text."""
+    with _read_only(path) as connection:
+        rows = connection.execute(
+            f"SELECT {OUTBOX_COLUMNS} FROM {OUTBOX_JOIN} ORDER BY o.job_id DESC"  # noqa: S608
+        )
+        return [OutboxRow(*row) for row in rows]
+
+
+def read_undelivered(path: Path) -> list[Reply]:
+    """Return every reply that still holds its text, oldest first.
+
+    That is a reply not delivered yet, and one that never will be: refused, failed or expired.
+    """
+    with _read_only(path) as connection:
+        rows = connection.execute(
+            f"SELECT {OUTBOX_COLUMNS}, o.message FROM {OUTBOX_JOIN} "  # noqa: S608
+            "WHERE o.message IS NOT NULL ORDER BY o.job_id"
+        )
+        return [Reply(OutboxRow(*row[:-1]), row[-1]) for row in rows]

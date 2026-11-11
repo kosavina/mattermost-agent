@@ -1,9 +1,10 @@
-"""The graph and the loop with a fake backend: every outcome, retries, crashes, approval."""
+"""The graph and the loop with a fake backend: every outcome, retries, crashes, approval, and
+the reply modes. The world replies with `local` unless a test chooses another mode."""
 
 import io
 import sqlite3
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,8 @@ from helpers import captured_logs, make_post, squeezed
 from langgraph.types import RetryPolicy
 
 from mattermost_agent.agents import AgentError, AgentResult, AgentTask
+from mattermost_agent.agents.prompt import REVIEWED, UNREVIEWED
+from mattermost_agent.classify import Kind
 from mattermost_agent.processor.checkpoints import (
     FILE_NAME as CHECKPOINTS,
 )
@@ -19,12 +22,12 @@ from mattermost_agent.processor.checkpoints import (
     thread_ids,
 )
 from mattermost_agent.processor.cli import decide_draft, format_drafts
-from mattermost_agent.processor.graph import ProcessorRuntime
+from mattermost_agent.processor.graph import ProcessorRuntime, State, _after_memory, thread
 from mattermost_agent.processor.loop import LOCK_FILE, Processor, Stop, hold_lock, release_lock
 from mattermost_agent.processor.memory import memory_versions, read_memory
 from mattermost_agent.processor.scenarios import Scenario
 from mattermost_agent.processor.settings import Roots
-from mattermost_agent.rules import Bursts, Rule, RuleSet
+from mattermost_agent.rules import Bursts, Replies, ReplyMode, Rule, RuleSet
 from mattermost_agent.settings import SettingsError
 from mattermost_agent.store import (
     DRAFT_RETENTION_SECONDS,
@@ -33,6 +36,8 @@ from mattermost_agent.store import (
     Store,
     read_drafts,
     read_jobs,
+    read_outbox,
+    read_undelivered,
 )
 
 NOW = 1_700_000_000.0
@@ -69,8 +74,13 @@ class FakeBackend:
         pass
 
 
-def answer(decision: str, memory: str | None = None, draft: str | None = None) -> dict[str, object]:
-    return {"decision": decision, "memory": memory, "draft": draft, "needs_review": False}
+def answer(
+    decision: str,
+    memory: str | None = None,
+    draft: str | None = None,
+    needs_review: bool = False,
+) -> dict[str, object]:
+    return {"decision": decision, "memory": memory, "draft": draft, "needs_review": needs_review}
 
 
 @dataclass
@@ -86,12 +96,23 @@ class World:
     def clock(self) -> float:
         return self.now
 
-    def job(self, message: str = POST_CANARY, post_id: str = "a", take: bool = True) -> Job:
+    def reply(self, mode: ReplyMode) -> None:
+        """Make the rule reply in `mode`, as a `reply:` line in the rules file would."""
+        self.runtime.rules = RuleSet((replace(RULE, reply=mode),), 20, BURSTS)
+
+    def job(
+        self,
+        message: str = POST_CANARY,
+        post_id: str = "a",
+        take: bool = True,
+        kind: Kind = "dm",
+        root_id: str = "",
+    ) -> Job:
         """Claim a job as the listener would and, unless `take` is off, take it like the loop."""
-        post = make_post(id=post_id, channel_id=CHANNEL, message=message)
+        post = make_post(id=post_id, channel_id=CHANNEL, message=message, root_id=root_id)
         outcome = self.store.claim(
             post,
-            kind="dm",
+            kind=kind,
             rule=RULE,
             place="@ivan",
             sender="ivan",
@@ -132,6 +153,7 @@ def world(tmp_path: Path) -> Iterator[World]:
         "rules: [{name: dm, dm: true, scenario: intake}]\n"
         "limits: {jobs_per_hour: 20}\n"
         "bursts: {quiet_seconds: 90, max_wait_seconds: 600, max_posts: 1}\n"
+        "replies: {default: local}\n"
     )
     store = Store(root / "state" / FILE_NAME)
     checkpointer = open_checkpointer(root / "state")
@@ -140,7 +162,7 @@ def world(tmp_path: Path) -> Iterator[World]:
     runtime = ProcessorRuntime(
         store=store,
         checkpointer=checkpointer,
-        rules=RuleSet((RULE,), 20, BURSTS),
+        rules=RuleSet((RULE,), 20, BURSTS, Replies(default="local")),
         scenarios={"intake": Scenario("intake", "intake", None)},
         roots=roots,
         backends={"fake": fake},
@@ -475,3 +497,220 @@ def test_only_one_processor_holds_the_lock(world: World) -> None:
         release_lock()
     hold_lock(state)  # free again once the first holder is gone
     release_lock()
+
+
+def test_a_draft_reply_is_queued_and_the_job_is_done(world: World) -> None:
+    world.reply("draft")
+    job = world.job()
+    world.fake.answers = [answer("act", memory=MEMORY_CANARY, draft=DRAFT_CANARY)]
+    with captured_logs() as log:
+        world.processor.run_job(job.id)
+    done = read_jobs(world.store.path)[0]
+    assert (done.status, done.decision, done.backend) == ("done", "act", "fake")
+    assert (done.reply_mode, done.delivery, done.approval) == ("draft", "queued", None)
+    assert world.memory() == MEMORY_CANARY
+    assert read_drafts(world.store.path) == []  # nothing waits for approve or reject
+    (reply,) = read_undelivered(world.store.path)
+    assert (reply.row.job_id, reply.row.mode, reply.row.state) == (job.id, "draft", "pending")
+    assert (reply.row.channel_id, reply.row.root_id) == (CHANNEL, "")
+    assert reply.text == DRAFT_CANARY
+    assert thread_ids(world.runtime.checkpointer) == set()
+    lines = squeezed(log.getvalue())
+    chars = len(DRAFT_CANARY)
+    assert (
+        f"event=reply_planned job={job.id} mode=draft downgrade=null outcome=queued chars={chars}"
+        in lines
+    )
+    assert f"event=job_done job={job.id} status=done fail_reason=null" in lines
+    assert REVIEWED in world.fake.tasks[0].prompt
+
+
+def test_a_send_reply_stays_a_send_when_every_check_passes(world: World) -> None:
+    world.reply("send")
+    job = world.job()
+    world.fake.answers = [answer("act", draft="Thanks @ivan, it is fixed.")]
+    with captured_logs() as log:
+        world.processor.run_job(job.id)
+    (row,) = read_outbox(world.store.path)
+    assert (row.mode, row.state, row.downgrade) == ("send", "pending", None)
+    assert read_jobs(world.store.path)[0].reply_mode == "send"
+    assert f"job={job.id} mode=send downgrade=null outcome=queued" in squeezed(log.getvalue())
+    assert UNREVIEWED in world.fake.tasks[0].prompt
+    # The label is the listener's to add, and only when it posts.
+    assert read_undelivered(world.store.path)[0].text == "Thanks @ivan, it is fixed."
+
+
+@pytest.mark.parametrize(
+    ("draft", "needs_review", "downgrade"),
+    [
+        ("See https://example.com/docs", False, "link"),
+        ("Ask @petr about it", False, "mention"),
+        ("x" * 1501, False, "length"),
+        ("Fine.", True, "needs_review"),
+    ],
+)
+def test_a_send_reply_that_fails_a_check_is_queued_as_a_draft(
+    world: World, draft: str, needs_review: bool, downgrade: str
+) -> None:
+    world.reply("send")
+    job = world.job()
+    world.fake.answers = [answer("act", draft=draft, needs_review=needs_review)]
+    with captured_logs() as log:
+        world.processor.run_job(job.id)
+    (row,) = read_outbox(world.store.path)
+    assert (row.mode, row.state, row.downgrade) == ("draft", "pending", downgrade)
+    assert read_jobs(world.store.path)[0].reply_mode == "draft"
+    assert f"mode=draft downgrade={downgrade} outcome=queued" in squeezed(log.getvalue())
+
+
+def test_the_agent_cannot_ask_for_a_send(world: World) -> None:
+    """needs_review false in draft mode changes nothing: only config chooses the mode."""
+    world.reply("draft")
+    job = world.job()
+    world.fake.answers = [answer("act", draft="Send this at once.", needs_review=False)]
+    world.processor.run_job(job.id)
+    assert [row.mode for row in read_outbox(world.store.path)] == ["draft"]
+    assert read_jobs(world.store.path)[0].id == job.id
+
+
+@pytest.mark.parametrize("mode", ["draft", "send"])
+def test_a_slash_command_is_refused_and_kept_for_the_terminal(
+    world: World, mode: ReplyMode
+) -> None:
+    world.reply(mode)
+    job = world.job()
+    world.fake.answers = [answer("act", draft="/away for the day")]
+    with captured_logs() as log:
+        world.processor.run_job(job.id)
+    done = read_jobs(world.store.path)[0]
+    assert (done.status, done.reply_mode, done.delivery) == ("done", "draft", "refused_command")
+    (reply,) = read_undelivered(world.store.path)
+    assert (reply.row.state, reply.row.outcome) == ("done", "refused_command")
+    assert f"job={job.id} mode=draft downgrade=null outcome=refused_command" in squeezed(
+        log.getvalue()
+    )
+    listing = format_drafts([], NOW + 60, [reply])
+    assert f"--- job {job.id} place=@ivan reply=draft state=done outcome=refused_command" in (
+        squeezed(listing)
+    )
+    assert "/away for the day" in listing
+
+
+def test_a_channel_reply_goes_into_a_thread_on_the_first_post(world: World) -> None:
+    world.reply("draft")
+    job = world.job(post_id="first-post", kind="channel")
+    world.fake.answers = [answer("act", draft="Yes.")]
+    world.processor.run_job(job.id)
+    assert [row.root_id for row in read_outbox(world.store.path)] == ["first-post"]
+
+
+def test_a_thread_reply_stays_in_its_thread(world: World) -> None:
+    world.reply("draft")
+    job = world.job(post_id="reply-post", kind="thread_reply", root_id="thread-root")
+    world.fake.answers = [answer("act", draft="Yes.")]
+    world.processor.run_job(job.id)
+    assert [row.root_id for row in read_outbox(world.store.path)] == ["thread-root"]
+
+
+@pytest.mark.parametrize("decision", ["ignore", "remember"])
+def test_nothing_is_queued_without_a_reply(world: World, decision: str) -> None:
+    world.reply("send")
+    job = world.job()
+    world.fake.answers = [answer(decision, memory="m" if decision == "remember" else None)]
+    world.processor.run_job(job.id)
+    done = read_jobs(world.store.path)[0]
+    assert (done.id, done.status, done.reply_mode, done.delivery) == (job.id, "done", None, None)
+    assert read_outbox(world.store.path) == []
+
+
+def test_a_crash_before_the_reply_is_queued_queues_it_once_on_the_next_start(
+    world: World,
+) -> None:
+    world.reply("draft")
+    job = world.job()
+    world.fake.answers = [answer("act", draft=DRAFT_CANARY)]
+    # The graph ran to its end, and the loop died before it could write to the store.
+    world.processor.graph.invoke({"job_id": job.id}, thread(job.id))
+    assert world.jobs() == [(job.id, "running", None, None, None)]
+    assert read_outbox(world.store.path) == []
+
+    fresh = Processor(world.runtime, poll_s=0.01)
+    fresh.resume_running()
+    assert world.jobs() == [(job.id, "done", "act", None, None)]
+    assert [reply.text for reply in read_undelivered(world.store.path)] == [DRAFT_CANARY]
+    assert len(world.fake.tasks) == 1  # the agent did not run again
+    assert thread_ids(world.runtime.checkpointer) == set()
+
+    fresh.run_job(job.id, resume=True)  # a second sweep finds nothing left to do
+    assert len(read_outbox(world.store.path)) == 1 and len(world.fake.tasks) == 1
+
+
+def test_a_mode_changed_in_config_after_the_run_does_not_change_the_reply(world: World) -> None:
+    """The mode is the one the agent was told about: it is kept in the job's state."""
+    world.reply("draft")
+    job = world.job()
+    world.fake.answers = [answer("act", draft="Fine.")]
+    world.processor.graph.invoke({"job_id": job.id}, thread(job.id))
+    world.reply("send")
+    Processor(world.runtime, poll_s=0.01).resume_running()
+    assert [row.mode for row in read_outbox(world.store.path)] == ["draft"]
+
+
+def test_a_checkpoint_from_before_reply_modes_waits_for_approval() -> None:
+    assert _after_memory(State(job_id=1, decision="act")) == "approve"
+    assert _after_memory(State(job_id=1, decision="act", mode="local")) == "approve"
+    for mode in ("draft", "send"):
+        assert _after_memory(State(job_id=1, decision="act", mode=mode)) != "approve"
+    assert State(job_id=1).needs_review is True
+
+
+def test_a_queued_reply_leaves_the_checkpoint_file_and_never_reaches_the_log(
+    world: World,
+) -> None:
+    world.reply("send")
+    job = world.job()
+    world.fake.answers = [answer("act", memory=MEMORY_CANARY, draft=DRAFT_CANARY)]
+    with captured_logs("DEBUG") as log:
+        world.processor.run_job(job.id)
+        format_drafts(read_drafts(world.store.path), NOW, read_undelivered(world.store.path))
+    assert read_undelivered(world.store.path)[0].text == DRAFT_CANARY
+    data = world.checkpoint_bytes()
+    assert DRAFT_CANARY.encode() not in data and POST_CANARY.encode() not in data
+    for canary in (POST_CANARY, MEMORY_CANARY, DRAFT_CANARY, "ivan", "Intake"):
+        assert canary not in log.getvalue()
+
+
+def test_the_drafts_listing_shows_local_drafts_and_queued_replies(world: World) -> None:
+    local = world.job(post_id="a")
+    world.fake.answers = [answer("act", draft="waits on the terminal")]
+    world.processor.run_job(local.id)
+    world.reply("draft")
+    queued = world.job(post_id="b")
+    world.fake.answers = [answer("act", draft=DRAFT_CANARY)]
+    world.processor.run_job(queued.id)
+    listing = format_drafts(
+        read_drafts(world.store.path), NOW + 120, read_undelivered(world.store.path)
+    )
+    lines = squeezed(listing)
+    assert f"--- job {local.id} place=@ivan backend=fake waiting=0h 02m" in lines
+    assert (
+        f"--- job {queued.id} place=@ivan reply=draft state=pending outcome=- reason=- "
+        "waiting=0h 02m" in lines
+    )
+    assert listing.index("waits on the terminal") < listing.index(DRAFT_CANARY)
+    assert format_drafts([], NOW) == "no drafts waiting\n"
+
+
+def test_housekeeping_forgets_the_thread_of_a_finished_job(world: World) -> None:
+    """The loop died after it finished the job and before it could delete the thread."""
+    job = world.job()
+    world.fake.answers = [answer("act", draft=DRAFT_CANARY)]
+    world.processor.run_job(job.id)
+    world.store.take_waiting(job.id, NOW)
+    world.store.set_done(job.id, now=NOW, approval="approved")
+    assert DRAFT_CANARY.encode() in world.checkpoint_bytes()
+    with captured_logs() as log:
+        world.processor.housekeeping()
+    assert thread_ids(world.runtime.checkpointer) == set()
+    assert DRAFT_CANARY.encode() not in world.checkpoint_bytes()
+    assert "event=threads_pruned" in squeezed(log.getvalue())
