@@ -53,9 +53,10 @@ def test_saving_the_same_text_again_changes_nothing(folder: Path) -> None:
     assert not (folder / "history").exists()
 
 
-def test_a_crash_before_the_rename_leaves_the_old_memory(
+def test_a_crash_before_the_rename_leaves_the_old_memory_and_no_duplicate(
     folder: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The old file is archived first, then replaced: it never disappears, even for an instant."""
     save_memory(folder, "one")
     real_replace = os.replace
 
@@ -67,6 +68,11 @@ def test_a_crash_before_the_rename_leaves_the_old_memory(
         save_memory(folder, "two")
     monkeypatch.setattr(os, "replace", real_replace)
     assert read_memory(folder) == "one"
+    assert memory_versions(folder) == 1  # the archive link was made before the failure
+    assert save_memory(folder, "two") == 2  # the rerun reuses it: no duplicate entry
+    assert read_memory(folder) == "two"
+    assert memory_versions(folder) == 1
+    assert sorted(p.read_text() for p in (folder / "history").iterdir()) == ["one"]
 
 
 def test_forget_shreds_and_removes_everything(folder: Path) -> None:
