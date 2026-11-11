@@ -447,6 +447,11 @@ class Store:
         *columns, draft = rows[0]
         return Draft(Job(*columns), draft or "")
 
+    def job(self, job_id: int) -> Job | None:
+        with self._transaction() as connection:
+            found = _jobs(connection, "WHERE id = ?", (job_id,))
+        return found[0] if found else None
+
     def jobs_in(self, status: JobStatus) -> list[Job]:
         """Return every job in `status`, oldest first."""
         with self._transaction() as connection:

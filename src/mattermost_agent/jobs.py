@@ -18,9 +18,10 @@ from mattermost_agent.store import FILE_NAME, Job, JobPost, StoreError, read_job
 # C0 and C1 control characters and DEL, except newline and tab, which keep a message readable.
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 NO_PLACE = "-"
+NO_VALUE = "-"
 COLUMNS = (
     f"{'id':>5}  {'status':<16} {'scenario':<12} {'rule':<20} {'place':<26} {'posts':>5}  "
-    f"{'opened':<19}  ready"
+    f"{'opened':<19}  {'ready':<19}  {'backend':<7} {'decision':<8} fail_reason"
 )
 
 
@@ -41,7 +42,8 @@ def _line(job: Job) -> str:
     place = NO_PLACE if job.place is None else safe_text(job.place)
     return (
         f"{job.id:>5}  {job.status:<16} {safe_text(job.scenario):<12} {safe_text(job.rule):<20} "
-        f"{place:<26} {job.post_count:>5}  {_when(job.opened_at)}  {_when(job.ready_at)}"
+        f"{place:<26} {job.post_count:>5}  {_when(job.opened_at)}  {_when(job.ready_at)}  "
+        f"{job.backend or NO_VALUE:<7} {job.decision or NO_VALUE:<8} {job.fail_reason or NO_VALUE}"
     )
 
 

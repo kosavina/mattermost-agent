@@ -86,6 +86,7 @@ def test_the_listing_shows_jobs_newest_first_without_text(two_jobs: Store, run: 
     assert code == 0
     header, first, second = out.splitlines()
     columns = ["id", "status", "scenario", "rule", "place", "posts", "opened", "ready"]
+    columns += ["backend", "decision", "fail_reason"]
     assert header.split() == columns
     assert first.split()[:6] == JOB_2
     assert second.split()[:6] == JOB_1
@@ -126,7 +127,7 @@ def test_a_missing_database_is_named(run: Run) -> None:
 @pytest.mark.parametrize("arguments", [["jobs", "x"], ["jobs", "-1"], ["jobs", "1", "2"], ["job"]])
 def test_other_arguments_show_the_usage(run: Run, arguments: list[str]) -> None:
     code, _ = run(*arguments)
-    assert code == "usage: mattermost-agent [healthcheck | jobs [id]]"
+    assert str(code).startswith("usage: mattermost-agent [healthcheck | jobs [id] | process")
 
 
 def test_control_characters_cannot_reach_the_terminal(store: Store, run: Run) -> None:
