@@ -2,13 +2,16 @@
 
     START -> decide --(ignore)----------------------------> END
                     --(remember)--> save_memory -----------> END
-                    --(act)-------> save_memory -> approve -> END  (approve pauses for Kirill)
+                    --(act)-------> save_memory -----------> END  (reply mode draft or send)
+                                                -> approve -> END  (local: pauses for Kirill)
 
 `decide` runs the agent; it is the only node that reads the burst, and the burst never enters the
-state (the checkpoint file holds the memory and the draft, never a post). `save_memory` is our
-code writing what the agent proposed. `approve` interrupts; `Command(resume=True|False)` from the
-approve or reject command continues it. The job's status in the jobs table is written by the
-loop that invokes the graph, from what invoke() returns; the nodes write files and the log.
+state (the checkpoint file holds the memory and the draft, never a post). It also records the
+rule's reply mode, which comes from config alone. `save_memory` is our code writing what the
+agent proposed. `approve` runs only for a `local` reply: it interrupts, and
+`Command(resume=True|False)` from the approve or reject command continues it. The job's status in
+the jobs table, and the outbox row of a reply bound for Mattermost, are written by the loop that
+invokes the graph, from what invoke() returns; the nodes write files and the log.
 """
 
 import time
@@ -48,6 +51,10 @@ class State:
     draft: str | None = None
     approved: bool | None = None
     denials: int = 0
+    # None in a checkpoint written before reply modes existed: such a job waits for approval.
+    mode: str | None = None
+    # True until the agent says otherwise, so that a missing value cannot allow a direct reply.
+    needs_review: bool = True
 
 
 @dataclass
@@ -133,6 +140,8 @@ def _decide(runtime: ProcessorRuntime) -> Node:
             "memory": answer.memory,
             "draft": answer.draft,
             "denials": result.denials,
+            "mode": resolved.reply,
+            "needs_review": answer.needs_review,
         }
 
     return decide
@@ -157,7 +166,7 @@ def _save_memory(runtime: ProcessorRuntime) -> Node:
 
 
 def approve(state: State) -> dict[str, object]:
-    """Pause until the approve or reject command answers. Nothing is sent in this milestone."""
+    """Pause until the approve or reject command answers. A local reply is never sent."""
     return {"approved": bool(interrupt({"job": state.job_id}))}
 
 
@@ -166,7 +175,7 @@ def _after_decide(state: State) -> str:
 
 
 def _after_memory(state: State) -> str:
-    return "approve" if state.decision == "act" else END
+    return "approve" if state.decision == "act" and state.mode in (None, "local") else END
 
 
 def build_graph(runtime: ProcessorRuntime) -> CompiledStateGraph:

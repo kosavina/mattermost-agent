@@ -12,7 +12,7 @@ import re
 import sys
 
 from mattermost_agent.app import HEARTBEAT_FILE, Runtime, healthcheck, serve
-from mattermost_agent.jobs import show_jobs
+from mattermost_agent.jobs import show_jobs, show_outbox
 from mattermost_agent.logs import configure_logging, log_lifecycle
 from mattermost_agent.mattermost import (
     MattermostClient,
@@ -25,8 +25,8 @@ from mattermost_agent.settings import SettingsError, load_settings
 from mattermost_agent.store import FILE_NAME, Store, StoreError
 
 USAGE = (
-    "usage: mattermost-agent [healthcheck | jobs [id] | process | drafts | approve <id> | "
-    "reject <id> | memory <channel_id> | memory forget <channel_id>]"
+    "usage: mattermost-agent [healthcheck | jobs [id] | outbox | process | drafts | "
+    "approve <id> | reject <id> | memory <channel_id> | memory forget <channel_id>]"
 )
 JOB_ID = re.compile(r"[0-9]{1,18}")
 CHANNEL_ID = re.compile(r"[a-z0-9]{26}")
@@ -41,6 +41,8 @@ def _command(arguments: list[str]) -> int | None:
             return show_jobs(os.environ, None)
         case ["jobs", job_id] if JOB_ID.fullmatch(job_id):
             return show_jobs(os.environ, int(job_id))
+        case ["outbox"]:
+            return show_outbox(os.environ)
         case ["process"]:
             from mattermost_agent.processor.loop import main as process
 

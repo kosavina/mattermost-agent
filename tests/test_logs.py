@@ -150,6 +150,7 @@ def test_long_text_is_cut(output: io.StringIO) -> None:
         logs.log_agent_error,
         logs.log_memory_saved,
         logs.log_job_done,
+        logs.log_reply_planned,
     ],
 )
 def test_no_parameter_can_carry_text_or_secrets(function: object) -> None:
@@ -166,6 +167,10 @@ def test_no_parameter_can_carry_text_or_secrets(function: object) -> None:
         "chars",
         "version",
         "fail_reason",
+        # A reply's: the delivery mode and three words of ours about what became of it.
+        "mode",
+        "downgrade",
+        "outcome",
         "event",
         "kind",
         "channel",
@@ -226,3 +231,15 @@ def test_a_traceback_stays_on_one_line(output: io.StringIO) -> None:
         logs.logger.exception("failed")
     assert output.getvalue().count("\n") == 1
     assert "\\nRuntimeError: boom" in output.getvalue()
+
+
+def test_reply_planned_line(output: io.StringIO) -> None:
+    logs.log_reply_planned(job_id=12, mode="draft", downgrade="link", outcome="queued", chars=640)
+    logs.log_reply_planned(
+        job_id=13, mode="draft", downgrade=None, outcome="refused_command", chars=5
+    )
+    lines = squeezed(output.getvalue())
+    assert (
+        "event=reply_planned job=12 mode=draft downgrade=link outcome=queued chars=640\n" in lines
+    )
+    assert "job=13 mode=draft downgrade=null outcome=refused_command chars=5\n" in lines

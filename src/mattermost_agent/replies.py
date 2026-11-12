@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
+from mattermost_agent.rules import DeliveryMode
 from mattermost_agent.store import Job, JobPost
 
 MAX_SEND_CHARS = 1_500
@@ -24,7 +25,6 @@ LINK_MARKS = ("://", "www.", "](", "![")
 # An @ and the username characters after it. A sentence's full stop is not part of the name.
 MENTION = re.compile(r"@([a-z0-9._-]*)(.?)", re.IGNORECASE | re.DOTALL)
 
-type DeliveryMode = Literal["draft", "send"]
 type Downgrade = Literal["needs_review", "length", "mention", "link"]
 
 

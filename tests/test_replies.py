@@ -1,12 +1,7 @@
 import pytest
 
-from mattermost_agent.replies import (
-    MAX_SEND_CHARS,
-    DeliveryMode,
-    content_downgrade,
-    is_command,
-    plan_reply,
-)
+from mattermost_agent.replies import MAX_SEND_CHARS, content_downgrade, is_command, plan_reply
+from mattermost_agent.rules import DeliveryMode
 from mattermost_agent.store import Job, JobPost
 
 TEXT_CANARY = "reply-canary-HERONLAMP"

@@ -86,7 +86,7 @@ def test_the_listing_shows_jobs_newest_first_without_text(two_jobs: Store, run: 
     assert code == 0
     header, first, second = out.splitlines()
     columns = ["id", "status", "scenario", "rule", "place", "posts", "opened", "ready"]
-    columns += ["backend", "decision", "fail_reason"]
+    columns += ["backend", "decision", "reply", "delivery", "fail_reason"]
     assert header.split() == columns
     assert first.split()[:6] == JOB_2
     assert second.split()[:6] == JOB_1
@@ -124,10 +124,12 @@ def test_a_missing_database_is_named(run: Run) -> None:
     assert code.startswith("mattermost-agent: cannot use the database")
 
 
-@pytest.mark.parametrize("arguments", [["jobs", "x"], ["jobs", "-1"], ["jobs", "1", "2"], ["job"]])
+@pytest.mark.parametrize(
+    "arguments", [["jobs", "x"], ["jobs", "-1"], ["jobs", "1", "2"], ["job"], ["outbox", "1"]]
+)
 def test_other_arguments_show_the_usage(run: Run, arguments: list[str]) -> None:
     code, _ = run(*arguments)
-    assert str(code).startswith("usage: mattermost-agent [healthcheck | jobs [id] | process")
+    assert str(code).startswith("usage: mattermost-agent [healthcheck | jobs [id] | outbox |")
 
 
 def test_control_characters_cannot_reach_the_terminal(store: Store, run: Run) -> None:
@@ -149,3 +151,96 @@ def test_a_post_time_out_of_range_is_shown_as_a_number(store: Store, run: Run) -
 def test_safe_text_keeps_ordinary_text() -> None:
     text = "Привет, @example.user!\n\tsee https://example.com/x?y=1"
     assert jobs.safe_text(text) == text
+
+
+def queue(store: Store, post_id: str, text: str, *, now: float, refused: bool = False) -> int:
+    """Open a one-post job, take it, and queue its reply as the processor would."""
+    post = make_post(id=post_id, channel_id=f"chat-{post_id}", create_at=int(now * 1000))
+    one_post = Bursts(quiet_seconds=90, max_wait_seconds=600, max_posts=1)
+    store.claim(
+        post,
+        kind="dm",
+        rule=RULE,
+        place="@example.user",
+        live=True,
+        now=now,
+        cap=20,
+        bursts=one_post,
+    )
+    job = store.take_ready(now)
+    assert job is not None
+    store.finish_with_reply(
+        job.id,
+        mode="draft",
+        root_id="",
+        message=text,
+        downgrade="link" if not refused else None,
+        refused=refused,
+        backend="codex",
+        decision="act",
+        now=now,
+    )
+    return job.id
+
+
+def test_the_outbox_listing_shows_replies_newest_first_without_text(
+    store: Store, run: Run, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = queue(store, "a", f"reply {SECRET_TEXT}", now=NOW)
+    second = queue(store, "b", "/away", now=NOW + 60, refused=True)
+    monkeypatch.setattr(jobs.time, "time", lambda: NOW + 3700)
+    code, out = run("outbox")
+    assert code == 0
+    header, newer, older = out.splitlines()
+    assert header.split() == [
+        "job",
+        "mode",
+        "place",
+        "state",
+        "outcome",
+        "downgrade",
+        "reason",
+        "age",
+    ]
+    assert newer.split() == [
+        str(second),
+        "draft",
+        "@example.user",
+        "done",
+        "refused_command",
+        "-",
+        "-",
+        "1h",
+        "00m",
+    ]
+    assert older.split() == [
+        str(first),
+        "draft",
+        "@example.user",
+        "pending",
+        "-",
+        "link",
+        "-",
+        "1h",
+        "01m",
+    ]
+    assert SECRET_TEXT not in out and "/away" not in out
+
+
+def test_the_jobs_listing_shows_how_a_reply_is_delivered(store: Store, run: Run) -> None:
+    queue(store, "a", "reply", now=NOW)
+    queue(store, "b", "/away", now=NOW + 1, refused=True)
+    _, out = run("jobs")
+    _, newer, older = out.splitlines()
+    assert newer.split()[-5:] == ["codex", "act", "draft", "refused_command", "-"]
+    assert older.split()[-5:] == ["codex", "act", "draft", "queued", "-"]
+
+
+def test_an_empty_outbox_says_so(store: Store, run: Run) -> None:
+    assert run("outbox") == (0, "no replies yet\n")
+
+
+def test_the_outbox_listing_never_reaches_the_log(store: Store, run: Run, log: io.StringIO) -> None:
+    queue(store, "a", f"reply {SECRET_TEXT}", now=NOW)
+    run("outbox")
+    assert log.getvalue() == ""

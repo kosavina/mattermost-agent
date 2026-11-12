@@ -26,6 +26,8 @@ REPLY_MODES = ("local", "draft", "send")
 MAX_LABEL = 200
 
 type ReplyMode = Literal["local", "draft", "send"]
+# The two modes that reach Mattermost.
+type DeliveryMode = Literal["draft", "send"]
 
 CHANNEL_NAME = re.compile(r"[a-z0-9_-]+", re.IGNORECASE)
 USERNAME = re.compile(r"[a-z0-9._-]+", re.IGNORECASE)
