@@ -125,7 +125,7 @@ def decide_draft(env: Mapping[str, str], job_id: int, *, approved: bool) -> int:
         forget_thread(runtime.checkpointer, job_id)
     except (SettingsError, RulesError, ScenariosError, StoreError) as error:
         raise SystemExit(f"mattermost-agent: {error}") from None
-    verb = "approved (not sent: this is a dry run)" if approved else "rejected"
+    verb = "approved (a local reply is never sent)" if approved else "rejected"
     sys.stdout.write(f"job {job_id} {verb}\n")
     return 0
 

@@ -1,7 +1,7 @@
 [project]
 name = "mattermost-agent"
 version = "0.1.0"
-description = "Mattermost listener: groups matching posts into jobs for an agent, in dry run"
+description = "A personal Mattermost agent: a listener that queues matching posts as jobs and delivers the replies, and a processor that runs a confined agent on each job"
 readme = "README.md"
 authors = [
     { name = "Kirill Savina", email = "99422083+kosavina@users.noreply.github.com" }

@@ -14,13 +14,14 @@ Nothing is posted in your name unless you ask for it twice: a rule marked `reply
 - Logs one line per post and per change to a job, without the message text.
 - Shows the queue on request: `mattermost-agent jobs`.
 - Runs one agent per job, confined to the scenario's instructions, that conversation's own memory and the project folders your rule attaches, all read-only. The agent's answer is `ignore`, `remember` (a new memory, written by our code) or `act` (a draft).
-- Shows waiting drafts with `drafts`, and takes `approve <id>` or `reject <id>`.
+- Delivers the agent's reply into Mattermost: as a draft in that chat's message box, or, for rules you mark and with a switch you set, as a labelled post. See [Replies](#replies).
+- Shows every reply that still has its text with `drafts`, what became of each reply with `outbox`, and takes `approve <id>` or `reject <id>` for replies kept on the terminal.
 
 **What it does not do**
 
 - It writes to Mattermost in two ways only: a draft in a message box, never over a draft that is already there, and, for `send` rules with `ALLOW_SEND=1`, a labelled post. It never reacts, edits or deletes. The agent itself never touches Mattermost; it only returns text.
 - The agent holds no token and has no network: it can only read the folders it was given.
-- It keeps the text of matched posts only, in its own database, for 7 days, and a conversation's memory until you forget it. Of every other post it keeps just the id.
+- It keeps the text of matched posts only, in its own database, for 7 days, and a conversation's memory until you forget it. Of every other post it keeps just the id. A reply's text is erased once it is in Mattermost.
 
 ## Quickstart
 
@@ -93,15 +94,7 @@ Rules are checked from top to bottom, and the first match wins. Every condition 
 
 Each rule also has a `name`, which the log and the queue show, and a `scenario`, the processor's scenario for the job. A rule may add `read`, a list of project folder names under the agent root's `projects/` that the agent may read for that rule (one path segment each: letters, digits, `-` and `_`); without it, the agent sees only the scenario folder and the conversation's own memory.
 
-A rule may also set `reply`, which says what happens to the agent's reply:
-
-| `reply` | What happens | Who sends |
-| --- | --- | --- |
-| `local` | the draft waits on the terminal (`drafts`, `approve`, `reject`) | nobody |
-| `draft` | the reply is put into that chat's message box as a Mattermost draft | you |
-| `send` | the reply is posted at once with a label, if every check passes; otherwise it becomes a draft. The rule must list its senders in `from` | the listener |
-
-A rule without `reply` uses `replies.default`, which is `draft` unless the file says otherwise. A reply bound for Mattermost waits in the outbox until the listener delivers it, usually within seconds; `mattermost-agent outbox` shows what became of each one.
+A rule may also set `reply`, which says what happens to the agent's reply: `local`, `draft` or `send`. A rule without it uses `replies.default`, which is `draft` unless the file says otherwise, and a rule that replies with `send` must list its senders in `from`. [Replies](#replies) explains the three modes.
 
 The file ends with two more sections, both required:
 
@@ -145,6 +138,66 @@ People write a request as several short messages. A **burst** is the matching po
 The processor will move a job on through `running`, `waiting_approval`, `done` and `failed`; the listener never touches a job after `ready`, except to record how its reply was delivered.
 
 **Where the state lives.** The database and the heartbeat are in the Docker volume `agent_data`. If you set `STATE_DIR` yourself, point it at a local disk, never at a network share or a VM shared folder (such as `/Volumes/My Shared Files` on a Mac): the listener and the `jobs` command share one SQLite file in WAL mode, which needs a local file system.
+
+## Replies
+
+When the agent decides to `act`, it returns a reply as text. The agent never touches Mattermost. Our code decides what happens to the text, from the rule's `reply` mode:
+
+| `reply` | What happens | Who sends |
+| --- | --- | --- |
+| `local` | The draft waits on the terminal (`drafts`, `approve`, `reject`). Nothing is written to Mattermost | nobody |
+| `draft` (the default) | The reply is put into that chat's message box as a Mattermost draft. You open the chat, edit it and press Enter | you |
+| `send` | The reply is posted at once, as you, with a label, if every check passes. Otherwise it becomes a draft | the listener |
+
+The processor has no token, so it only writes the reply into the **outbox**, a table in the shared database. The listener, which holds the token, picks it up within a few seconds and delivers it.
+
+**Where a reply goes.** In a channel, always into a thread: the burst's own thread, or a new one on the burst's first post. In a direct or group message, where the burst was.
+
+**Drafts.**
+
+- A draft appears in the message box and in the sidebar's **Drafts** list at once, also while you have that chat open.
+- A draft is never written over another one. If the message box already holds text or attachments, the reply waits and tries again every minute, for up to three days. `mattermost-agent drafts` shows a waiting reply with its text. This also holds for the agent's own earlier draft: a second reply to the same place waits until you have sent or deleted the first.
+- If you have posted in that place since the burst, the reply is dropped as `skipped_answered` and nothing is written.
+- A reply that starts with `/` is never put into a message box, where Enter would run it as a slash command. It is kept as `refused_command`, and `drafts` shows it.
+
+**Direct sending.** It needs two keys: a rule with `reply: send` that lists its senders in `from`, and `ALLOW_SEND=1` in the listener's environment. Restarting the listener without `ALLOW_SEND` stops all sending. Each reply must pass these checks, in this order, and the first one that fails turns it into a draft:
+
+| Check | Logged as `downgrade=` |
+| --- | --- |
+| The agent did not ask for review (`needs_review`) | `needs_review` |
+| At most 1,500 characters | `length` |
+| No `@` except exactly the sender's own name. So no `@channel`, `@all`, `@here`, no other person, no e-mail address | `mention` |
+| Nothing a link or an image needs: `//`, `www.`, `[`, `]`, `<`, `>` | `link` |
+| No character reference (`&#64;`), backslash, code fence, or invisible character | `markup` |
+| The listener's own rules still mark the rule as `send` | `rule` |
+| The burst is not your own. Your own messages never get a direct reply | `own_burst` |
+| `ALLOW_SEND=1` | `kill_switch` |
+| The burst's last post is at most `max_send_age_minutes` old | `stale` |
+| Fewer than `sends_per_hour` direct replies in the last hour, and fewer than `sends_per_chat_per_hour` in this chat | `cap`, `chat_cap` |
+
+The content checks are deliberately strict: they allow plain text and little else, because a reply that becomes a draft costs you one press of Enter, and a wrong post under your name costs more. The processor runs them before it queues the reply, and the listener runs them again before it posts.
+
+A direct reply ends with the label on a line of its own, and carries a hidden marker by which the listener knows its own posts and never treats them as a new request. A post is tried once and never repeated: if the server's answer is lost, the listener later reads the chat, and either finds its post or puts the reply into the message box as a draft (`downgrade=unconfirmed`). A post the server refuses becomes a draft too (`downgrade=refused`).
+
+**What became of a reply.** `mattermost-agent outbox` lists the replies without their text:
+
+```text
+  job  mode  place                      state      outcome          downgrade    reason          age
+   13  send  @example.user              done       sent             -            -               0h 02m
+   12  draft @example.user              done       drafted          kill_switch  -               0h 05m
+   11  draft analytics                  pending    -                -            draft_busy      1h 10m
+```
+
+| `outcome` | Meaning |
+| --- | --- |
+| `drafted` | It is in the message box |
+| `sent` | It was posted |
+| `skipped_answered` | You had already answered there; nothing was written |
+| `refused_command` | It starts with `/`; it reached no message box |
+| `failed` | It could not be delivered. `reason` says why: `drafts_disabled` (the server has synced drafts switched off), `no_channel` (you are no longer in that chat), or an error word |
+| `expired` | It waited three days, usually behind another draft |
+
+While a reply waits, `reason` is `draft_busy`, `unreachable` (the server did not answer; it tries again every 20 seconds) or `no_team`. The text of a delivered reply is erased from the database at once; a reply that was refused, failed or expired keeps its text for `drafts` until its job is deleted after 7 days.
 
 ## Processor
 
@@ -193,7 +246,7 @@ The processor refuses to start if any `MM_*` variable is set (it must never hold
 **Running it.** Both processes must run from the same checkout: the processor adds columns and the outbox table to the shared database (schema version 4), and an older listener would refuse the file.
 
 ```sh
-# Terminal 1, the listener
+# Terminal 1, the listener. Add ALLOW_SEND=1 only if `send` rules may post directly
 STATE_DIR=~/agent/state MM_URL=https://... MM_TOKEN_FILE=~/agent/secrets/mm_token RULES_FILE=~/agent/rules.yaml uv run mattermost-agent
 # Terminal 2, the processor
 STATE_DIR=~/agent/state AGENT_ROOT=~/agent RULES_FILE=~/agent/rules.yaml uv run mattermost-agent process
@@ -225,14 +278,18 @@ They check, with the exact command the adapters build, that each agent cannot re
 
 1. The token grants everything your account can do, so it lives only in a Docker secret file, never in `.env`, the image or `docker inspect`.
 2. One module writes to Mattermost, `mattermost_write.py`, with three calls: list drafts, put a draft, create a post. Only `deliver.py` may import it, and tests enforce both that and that the reading client sends only GET requests. Without `ALLOW_SEND=1` the writer cannot create a post whatever the code above it does.
-3. Logs have no field for message text, tokens or headers, and errors are logged by class name only. Message text exists in one place only: the `job_posts` table of the database, for matched posts, for 7 days. The database and its side files are readable by the listener's user alone (mode 600), and deleted text is overwritten rather than left in free space.
+3. Logs have no field for message text, tokens or headers, and errors are logged by class name only. Text exists in three places in the database: the matched posts (`job_posts`, for 7 days), a `local` draft on its job, and a reply in the outbox until it is delivered. The database and its side files are readable by the listener's user alone (mode 600), and deleted text is overwritten rather than left in free space.
 4. It connects only to your `https://` server: plain HTTP, proxies and redirects are refused, so the token cannot be sent anywhere else.
 5. The container runs as a non-root user with a read-only filesystem, no Linux capabilities and no open ports.
 6. `mattermost-agent jobs <id>`, `drafts` and `memory <channel_id>` are the only things that show text, on your terminal and never in the log. Control characters are escaped first, so a message cannot drive your terminal.
-7. The processor holds no token and refuses to start with one in its environment. Its code never imports the Mattermost client, and a test checks that.
+7. The processor holds no token and refuses to start with one in its environment. Its code never imports the Mattermost client, the writer or the deliver loop, and tests check that. It can only write a reply into the outbox; the listener decides whether and how that reply reaches Mattermost.
 8. Our code decides every flag, folder and permission of an agent run; nothing in a message, in a memory or in the agent's answer can change them. The agent reads only the scenario folder, the conversation's own folder and the attached projects, all resolved through symlinks and checked against their roots, and cannot write or reach the network. Its answer is parsed into three fields and used as data.
 9. The agent proposes a memory; the processor writes it. A conversation's memory is built from other people's messages, so it is untrusted data: it goes to the agent inside the data block, it is kept in a folder only the processor writes, and `memory forget` overwrites it with zeros before deleting it.
-10. The processor's logs carry only numbers and fixed words about a run: the backend, the decision, the duration, the attempt, how many tool calls were refused. The prompt, the memory, the draft and the agent's output never reach a log line or an error message. The checkpoint file holds a running job's memory and draft until the job ends, never a post, with mode 600 and overwritten on deletion.
+10. The processor's logs carry only numbers and fixed words about a run: the backend, the decision, the duration, the attempt, how many tool calls were refused; of a reply, only its mode, its length and what became of it. The prompt, the memory, the draft and the agent's output never reach a log line or an error message. The checkpoint file holds a running job's memory and draft until the job ends, never a post, with mode 600 and overwritten on deletion.
+11. The agent never posts. Our code delivers its reply, and nothing in a message, a memory or the agent's answer can choose the mode, the chat or the thread: the mode comes from `rules.yaml`, and the checks can only turn a `send` into a draft, never the reverse. The text that is drafted or posted is exactly the text the checks saw; a post gets the label, and nothing else is added.
+12. A direct post needs a `send` rule that names its senders and `ALLOW_SEND=1`, then passes every check in [Replies](#replies), in the processor and again in the listener. Without `ALLOW_SEND=1` the writer cannot create a post at all. At most one post is ever attempted per reply, so a crash or a lost answer cannot post twice.
+13. A draft of yours is never overwritten or deleted by the code: a message box that holds text or attachments makes the reply wait, and the writer refuses an empty draft, which the server would treat as "delete". One gap remains, and is listed under Known limits.
+14. The listener ignores its own direct replies, which it knows by a marker on posts of its own account. The same marker on anyone else's post changes nothing, so it cannot be used to hide a message.
 
 ## Reading the logs
 
@@ -290,6 +347,20 @@ event=disconnected reason=unreachable error=ConnectError status=null count=null 
 
 `reason` is one of `auth_rejected` (the token is wrong or expired), `unreachable`, `server_error`, `protocol_error`, `store_error` or `signal`.
 
+The listener adds three events about replies:
+
+```text
+event=reply_delivered job=12 mode=draft outcome=drafted downgrade=kill_switch reason=null channel="<channel_id>"
+event=draft_busy job=14 channel="<channel_id>"
+event=reply_waiting job=15 reason=unreachable status=503 channel="<channel_id>"
+```
+
+| Event | Meaning |
+| --- | --- |
+| `reply_delivered` | A reply left the outbox. `mode` is how it went out in the end, `outcome` what became of it, `downgrade` the check that turned a `send` into a draft, and `reason` why it failed. The words are explained in [Replies](#replies) |
+| `draft_busy` | The message box already holds a draft, so the reply waits. Logged once per reply, not once per try |
+| `reply_waiting` | The reply waits for the server (`unreachable`), for a team to list its drafts under (`no_team`), or to be confirmed after a lost answer (`unconfirmed`) |
+
 The processor adds five events:
 
 ```text
@@ -308,7 +379,7 @@ event=job_done   job=12 status=waiting_approval fail_reason=null
 | `reply_planned` | A reply went to the outbox. `mode` is `draft` or `send`; `downgrade` names the check that turned a `send` into a draft (`needs_review`, `length`, `mention`, `link`, `markup`); `outcome` is `queued`, or `refused_command` for a reply that starts with `/`; `chars` is its length |
 | `job_done` | The job left the processor: `status` is `waiting_approval`, `done` or `failed`, and `fail_reason` one of `agent_failed`, `agent_timeout`, `invalid_output`, `unknown_scenario`, `unknown_rule`, `bad_folder`, `expired` |
 
-`LOG_LEVEL` in `.env` sets the level: `DEBUG`, `INFO`, `WARNING` or `ERROR`. The default is `INFO`.
+`LOG_LEVEL` in `.env` sets the level: `DEBUG`, `INFO`, `WARNING` or `ERROR`. The default is `INFO`. `ALLOW_SEND=1` in `.env` lets rules marked `reply: send` post directly; leave it out and every reply is a draft (see [Replies](#replies)).
 
 ## Known limits
 
@@ -319,6 +390,11 @@ event=job_done   job=12 status=waiting_approval fail_reason=null
 - **First run.** It starts from now and does not read old posts.
 - **Long outages.** Catch-up goes back at most 30 days.
 - **Rules** are read at startup, so a change needs a restart.
+- **Mentions without an `@`.** Mattermost also notifies people on their first name or their own keywords. No check can see those, so a direct reply can still notify someone it names.
+- **The agent can be wrong.** The checks on a direct reply look at its form, not at whether it is true. Mark a rule `send` only for people and questions where a wrong answer under your name is acceptable, and write the scenario's instructions accordingly.
+- **Two agents.** If someone you named in a `send` rule also runs an agent that answers you directly, the two would answer each other until the hourly caps stop them.
+- **Replies in the phone app** were not tried. Drafts are synced by the server, so they should appear there too.
+- **Several teams.** A direct message's drafts are looked for under every team you are in. This was tried with one team only.
 - **Text typed in the last seconds.** A draft is never written over one the server knows, and your app syncs what you type within seconds. Text typed in the very seconds before a reply arrives is not on the server yet, and the reply replaces it in the message box.
 - **Claude Code uses your own login.** Until it gets a separate config folder and token, every run reads your Keychain login and rewrites `~/.claude.json` (with a backup under `~/.claude/backups/`). It leaves no transcript and no memory. Codex uses the separate `~/agent/codex-home`.
 - **A `kill -9` during a run** leaves the agent to finish or time out on its own; the next start removes its temp folder and runs the job once more.
