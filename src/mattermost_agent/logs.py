@@ -229,3 +229,46 @@ def log_reply_planned(
         outcome,
         chars,
     )
+
+
+def log_reply_delivered(
+    *,
+    job_id: int,
+    mode: str,
+    outcome: str,
+    downgrade: str | None,
+    reason: str | None,
+    channel_id: str,
+) -> None:
+    """Write the one line for a reply that left the outbox: what became of it, and where.
+
+    `mode` is how it went out in the end, and `downgrade` the check that turned a direct reply
+    into a draft. `reason` says why a reply failed.
+    """
+    logger.info(
+        "event=%-10s job=%-5d mode=%-5s outcome=%-16s downgrade=%-12s reason=%-15s channel=%s",
+        "reply_delivered",
+        job_id,
+        mode,
+        outcome,
+        downgrade or NO_VALUE,
+        reason or NO_VALUE,
+        _quoted(channel_id),
+    )
+
+
+def log_draft_busy(*, job_id: int, channel_id: str) -> None:
+    """Write the one line for a reply that waits because its message box already holds a draft."""
+    logger.info("event=%-10s job=%-5d channel=%s", "draft_busy", job_id, _quoted(channel_id))
+
+
+def log_reply_waiting(*, job_id: int, reason: str, status: int | None, channel_id: str) -> None:
+    """Write the one line for a reply that waits for the server, or to be confirmed."""
+    logger.info(
+        "event=%-10s job=%-5d reason=%-14s status=%-4s channel=%s",
+        "reply_waiting",
+        job_id,
+        reason,
+        NO_VALUE if status is None else status,
+        _quoted(channel_id),
+    )

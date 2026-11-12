@@ -9,6 +9,9 @@ quoting its value: the value could be somebody's message.
 
 The event's sender_name is ignored on purpose. A webhook can set it to any name, so the sender is
 looked up from the post's user_id instead.
+
+Of a post's props, one thing is kept: whether they carry the marker our own code puts on a reply
+it posts. The props themselves are never stored, so nothing of them can reach a log.
 """
 
 import json
@@ -16,6 +19,9 @@ from dataclasses import dataclass, field
 from typing import cast
 
 CHANNEL_TYPES = frozenset({"D", "G", "O", "P"})
+# The prop on every post our code creates. Anyone can set a prop, so it counts only on a post of
+# the listener's own account.
+AGENT_PROP = "from_mattermost_agent"
 
 
 class MalformedEvent(Exception):
@@ -36,12 +42,30 @@ class Me:
 
 @dataclass(frozen=True)
 class Channel:
-    """One row of the channel listing. Type D is a DM and G a group DM."""
+    """One row of the channel listing. Type D is a DM and G a group DM, which have no team."""
 
     id: str
     name: str
     type: str
     last_post_at: int
+    team_id: str = ""
+
+
+@dataclass(frozen=True)
+class ChatDraft:
+    """A draft in a message box, as the server lists it. repr() leaves out the text.
+
+    `has_files` is for a draft that holds attachments, perhaps with no text at all.
+    """
+
+    channel_id: str
+    root_id: str
+    message: str = field(repr=False)
+    has_files: bool = False
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.message.strip() and not self.has_files
 
 
 @dataclass(frozen=True)
@@ -49,6 +73,7 @@ class Post:
     """One post. Times are Unix milliseconds. repr() leaves out the text.
 
     `mentions` holds the mentioned user ids, or None when the server did not say, as in REST.
+    `from_agent` says that the props carry our marker; whose post it is, is a separate question.
     """
 
     id: str
@@ -62,6 +87,7 @@ class Post:
     deleted: bool
     message: str = field(repr=False)
     mentions: frozenset[str] | None
+    from_agent: bool = False
 
 
 def _decoded(value: object, what: str) -> object:
@@ -120,6 +146,11 @@ def _channel_type(container: dict[str, object], key: str) -> str:
     return value
 
 
+def _has_marker(props: object) -> bool:
+    """Say whether a post's props carry our marker: the JSON value true, and nothing like it."""
+    return isinstance(props, dict) and props.get(AGENT_PROP) is True
+
+
 def _post(
     raw: dict[str, object],
     channel_type: str,
@@ -138,6 +169,7 @@ def _post(
         deleted=_number(raw, "delete_at", 0) != 0,
         message=_text(raw, "message", ""),
         mentions=mentions,
+        from_agent=_has_marker(raw.get("props")),
     )
 
 
@@ -171,6 +203,7 @@ def parse_channel(raw: object) -> Channel:
         name=_text(channel, "name"),
         type=_channel_type(channel, "type"),
         last_post_at=_number(channel, "last_post_at", 0),
+        team_id=_text(channel, "team_id", ""),
     )
 
 
@@ -214,3 +247,29 @@ def parse_post_page(body: object, channel: Channel) -> list[Post]:
         )
         for post_id in order
     ]
+
+
+def parse_drafts(body: object) -> list[ChatDraft]:
+    """Return the drafts of one listing. The server answers `null` when there are none."""
+    if body is None:
+        return []
+    if not isinstance(body, list):
+        raise MalformedEvent("draft list is not a list")
+    drafts: list[ChatDraft] = []
+    for row in body:
+        draft = _mapping(row, "draft")
+        drafts.append(
+            ChatDraft(
+                channel_id=_text(draft, "channel_id"),
+                root_id=_text(draft, "root_id", ""),
+                message=_text(draft, "message", ""),
+                # Anything but "no files" counts as files: a draft is protected when in doubt.
+                has_files=draft.get("file_ids") not in (None, []),
+            )
+        )
+    return drafts
+
+
+def parse_created_post(body: object) -> str:
+    """Return the id of the post the server says it created."""
+    return _text(_mapping(body, "post"), "id")

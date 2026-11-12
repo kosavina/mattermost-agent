@@ -12,9 +12,16 @@ def is_own(post: Post, me: Me) -> bool:
     return post.user_id == me.user_id
 
 
-def is_ignored(post: Post) -> bool:
-    """Skip posts already deleted, and "X joined the channel" notices."""
-    return post.deleted or post.post_type.startswith("system_")
+def is_ignored(post: Post, me: Me) -> bool:
+    """Skip posts already deleted, "X joined the channel" notices, and our own direct replies.
+
+    A reply our code posted comes back as a post of mine, and must not open a job. It is known by
+    its marker, which counts only on my own posts: anyone can put the same prop on theirs, and
+    that must not hide a post. A draft I send myself has no marker and is an ordinary post of mine.
+    """
+    if post.deleted or post.post_type.startswith("system_"):
+        return True
+    return post.from_agent and is_own(post, me)
 
 
 def _text_mentions(message: str, username: str) -> bool:
