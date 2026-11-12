@@ -12,6 +12,11 @@
 #   read      optional: project folders under ~/agent/projects that the agent may read for this
 #             rule, by folder name. Without it, the agent sees only the scenario and the
 #             conversation's own memory
+#   reply     optional: what happens to the agent's reply for this rule. local: it waits on the
+#             terminal. draft: it is put into that chat's message box, and you send it yourself.
+#             send: it is posted at once with a label, if every check passes, and becomes a
+#             draft otherwise; a send rule must list its senders in from. Without it, the rule
+#             uses replies.default
 #
 # Quote words that YAML reads as something else: "on", "off", "yes", "no", "null", or a number.
 rules:
@@ -23,6 +28,11 @@ rules:
     from: [example.user]
     scenario: intake
     read: [sales-reports]
+  - name: team-questions
+    dm: true
+    from: [example.user, other.user]
+    scenario: intake
+    reply: send
 
 limits:
   jobs_per_hour: 20          # new jobs opened in any 60 minutes; posts joining a job don't count
@@ -31,3 +41,12 @@ bursts:
   quiet_seconds: 90          # a burst is ready after this long with no new post
   max_wait_seconds: 600      # and at the latest this long after its first post
   max_posts: 20              # and at the latest when it holds this many posts
+
+# Optional, and so is every key in it; these are the values used without it. All but `default`
+# matter only for rules that reply with send.
+replies:
+  default: draft                 # local, draft or send, for rules without `reply`
+  sends_per_hour: 5              # direct replies in any 60 minutes, in total
+  sends_per_chat_per_hour: 2     # and in one chat
+  max_send_age_minutes: 30       # a reply to an older burst becomes a draft
+  label: "_Auto-reply by Kirill's assistant_"   # added to a direct reply on a line of its own

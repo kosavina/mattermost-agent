@@ -93,6 +93,16 @@ Rules are checked from top to bottom, and the first match wins. Every condition 
 
 Each rule also has a `name`, which the log and the queue show, and a `scenario`, the processor's scenario for the job. A rule may add `read`, a list of project folder names under the agent root's `projects/` that the agent may read for that rule (one path segment each: letters, digits, `-` and `_`); without it, the agent sees only the scenario folder and the conversation's own memory.
 
+A rule may also set `reply`, which says what happens to the agent's reply:
+
+| `reply` | What happens | Who sends |
+| --- | --- | --- |
+| `local` | the draft waits on the terminal (`drafts`, `approve`, `reject`) | nobody |
+| `draft` | the reply is put into that chat's message box as a Mattermost draft | you |
+| `send` | the reply is posted at once with a label, if every check passes; otherwise it becomes a draft. The rule must list its senders in `from` | the listener |
+
+A rule without `reply` uses `replies.default`, which is `draft` unless the file says otherwise. The modes are read and checked already, but delivery is not built yet: until it is, every reply waits on the terminal as with `local`.
+
 The file ends with two more sections, both required:
 
 ```yaml
@@ -106,6 +116,19 @@ bursts:
 ```
 
 The three burst settings are whole numbers of at least 1, and `quiet_seconds` may not be larger than `max_wait_seconds`.
+
+An optional `replies` section sets the default reply mode and the limits for `send`. Every key is optional; these are the values used without it:
+
+```yaml
+replies:
+  default: draft                 # local, draft or send, for rules without `reply`
+  sends_per_hour: 5              # direct replies in any 60 minutes, in total
+  sends_per_chat_per_hour: 2     # and in one chat
+  max_send_age_minutes: 30       # a reply to an older burst becomes a draft
+  label: "_Auto-reply by Kirill's assistant_"   # added to a direct reply on a line of its own
+```
+
+The numbers are whole numbers of at least 1, and the label is one line of at most 200 characters. Sending also needs `ALLOW_SEND=1` in the listener's environment; without it every `send` reply becomes a draft.
 
 Being @mentioned is not a condition: an @mention in a channel no rule names does not open a job. Neither is the text of a post. The listener refuses a file it cannot fully understand (an unknown key, a condition of the wrong type, a missing section) with one line naming the rule number, so a typo cannot silently widen a rule.
 

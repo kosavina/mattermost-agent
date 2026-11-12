@@ -9,17 +9,23 @@ import re
 from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import yaml
 
 from mattermost_agent.events import Post
 
-TOP_LEVEL_KEYS = frozenset({"rules", "limits", "bursts"})
+TOP_LEVEL_KEYS = frozenset({"rules", "limits", "bursts", "replies"})
 LIMIT_KEYS = frozenset({"jobs_per_hour"})
 BURST_KEYS = ("quiet_seconds", "max_wait_seconds", "max_posts")
-RULE_KEYS = frozenset({"name", "scenario", "dm", "channels", "from", "read"})
+REPLY_NUMBER_KEYS = ("sends_per_hour", "sends_per_chat_per_hour", "max_send_age_minutes")
+REPLY_KEYS = frozenset({"default", "label", *REPLY_NUMBER_KEYS})
+RULE_KEYS = frozenset({"name", "scenario", "dm", "channels", "from", "read", "reply"})
 CONDITION_KEYS = frozenset({"dm", "channels", "from"})
+REPLY_MODES = ("local", "draft", "send")
+MAX_LABEL = 200
+
+type ReplyMode = Literal["local", "draft", "send"]
 
 CHANNEL_NAME = re.compile(r"[a-z0-9_-]+", re.IGNORECASE)
 USERNAME = re.compile(r"[a-z0-9._-]+", re.IGNORECASE)
@@ -42,6 +48,8 @@ class Rule:
     senders: frozenset[str]
     read: tuple[str, ...] = ()
     """Project folders the processor attaches read-only, by name under the agent root."""
+    reply: ReplyMode | None = None
+    """How this rule's replies are delivered. None means the file's default."""
 
 
 @dataclass(frozen=True)
@@ -54,15 +62,35 @@ class Bursts:
 
 
 @dataclass(frozen=True)
+class Replies:
+    """How replies reach Mattermost. Everything but `default` matters only for `send`.
+
+    `local` keeps the draft on the terminal, `draft` puts it into the chat's message box, and
+    `send` posts it with `label` on a line of its own, within the caps and the age limit.
+    """
+
+    default: ReplyMode = "draft"
+    sends_per_hour: int = 5
+    sends_per_chat_per_hour: int = 2
+    max_send_age_minutes: int = 30
+    label: str = "_Auto-reply by Kirill's assistant_"
+
+
+@dataclass(frozen=True)
 class RuleSet:
     rules: tuple[Rule, ...]
     jobs_per_hour: int
     bursts: Bursts
+    replies: Replies = Replies()
 
     @property
     def channel_names(self) -> frozenset[str]:
         """Return every channel the rules name, which catch-up reads besides the DMs."""
         return frozenset(name for rule in self.rules for name in rule.channels)
+
+    def reply_mode(self, rule: Rule) -> ReplyMode:
+        """Return how the rule's replies are delivered: its own `reply`, or the default."""
+        return rule.reply or self.replies.default
 
 
 class _StrictLoader(yaml.SafeLoader):
@@ -139,6 +167,12 @@ def _whole_number(value: object, where: str) -> int:
     return value
 
 
+def _reply_mode(value: object, where: str) -> ReplyMode:
+    if not isinstance(value, str) or value not in REPLY_MODES:
+        raise RulesError(f"{where} must be one of: {', '.join(REPLY_MODES)}")
+    return value
+
+
 def _rule(value: object, number: int) -> Rule:
     where = f"rule {number}"
     raw = _mapping(value, where, RULE_KEYS)
@@ -163,6 +197,7 @@ def _rule(value: object, number: int) -> Rule:
             _text_list(raw["from"], f"{where} from", USERNAME) if "from" in raw else ()
         ),
         read=folder_names(raw["read"], f"{where} read") if "read" in raw else (),
+        reply=_reply_mode(raw["reply"], f"{where} reply") if "reply" in raw else None,
     )
 
 
@@ -172,6 +207,35 @@ def _bursts(value: object) -> Bursts:
     if bursts.quiet_seconds > bursts.max_wait_seconds:
         raise RulesError("bursts quiet_seconds must be at most max_wait_seconds")
     return bursts
+
+
+def _label(value: object) -> str:
+    label = _text(value, "replies label")
+    if len(label) > MAX_LABEL or "\n" in label or "\r" in label:
+        raise RulesError(f"replies label must be one line of at most {MAX_LABEL} characters")
+    return label
+
+
+def _replies(value: object) -> Replies:
+    """Return the `replies` section. Every key is optional, and so is the section."""
+    defaults = Replies()
+    if value is None:
+        return defaults
+    raw = _mapping(value, "replies", REPLY_KEYS)
+    numbers = {
+        key: _whole_number(raw[key], f"replies {key}") for key in REPLY_NUMBER_KEYS if key in raw
+    }
+    return Replies(
+        default=_reply_mode(raw["default"], "replies default")
+        if "default" in raw
+        else defaults.default,
+        sends_per_hour=numbers.get("sends_per_hour", defaults.sends_per_hour),
+        sends_per_chat_per_hour=numbers.get(
+            "sends_per_chat_per_hour", defaults.sends_per_chat_per_hour
+        ),
+        max_send_age_minutes=numbers.get("max_send_age_minutes", defaults.max_send_age_minutes),
+        label=_label(raw["label"]) if "label" in raw else defaults.label,
+    )
 
 
 def parse_rules(text: str) -> RuleSet:
@@ -186,7 +250,14 @@ def parse_rules(text: str) -> RuleSet:
 
     limits = _mapping(top.get("limits"), "limits", LIMIT_KEYS)
     cap = _whole_number(limits.get("jobs_per_hour"), "limits jobs_per_hour")
-    return RuleSet(rules=rules, jobs_per_hour=cap, bursts=_bursts(top.get("bursts")))
+    replies = _replies(top.get("replies"))
+    for number, rule in enumerate(rules, start=1):
+        # A reply posted without review goes only to people named in the file.
+        if (rule.reply or replies.default) == "send" and not rule.senders:
+            raise RulesError(f"rule {number} replies with send, so it must name senders in from")
+    return RuleSet(
+        rules=rules, jobs_per_hour=cap, bursts=_bursts(top.get("bursts")), replies=replies
+    )
 
 
 def load_rules(path: Path) -> RuleSet:

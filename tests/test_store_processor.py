@@ -182,6 +182,23 @@ def test_take_ready_is_oldest_first_and_once(store: Store) -> None:
     assert store.take_ready(NOW + 12) is None
 
 
+def test_a_taken_job_knows_its_thread(store: Store) -> None:
+    post = make_post(id="reply", channel_id=CHANNEL, root_id="root-post")
+    store.claim(
+        post,
+        kind="thread_reply",
+        rule=INTAKE,
+        place="analytics",
+        live=True,
+        now=NOW,
+        cap=10,
+        bursts=BURSTS,
+    )
+    taken = store.take_ready(NOW + 1)
+    assert taken is not None and taken.root_id == "root-post"
+    assert ready_job(store, "top").root_id == ""
+
+
 def test_take_ready_skips_collecting_jobs(store: Store) -> None:
     post = make_post(id="c", channel_id=CHANNEL)
     store.claim(

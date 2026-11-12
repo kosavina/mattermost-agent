@@ -20,7 +20,7 @@ from mattermost_agent.processor.scenarios import (
     scenario_dir,
 )
 from mattermost_agent.processor.settings import Roots, inside
-from mattermost_agent.rules import RuleSet
+from mattermost_agent.rules import ReplyMode, RuleSet
 
 # Mattermost ids are 26 characters of a base-32 alphabet. Anything else never becomes a path.
 CHANNEL_ID = re.compile(r"[a-z0-9]{26}")
@@ -42,6 +42,7 @@ class Resolved:
     conversation_dir: Path
     read_dirs: tuple[Path, ...]
     backend: str
+    reply: ReplyMode
     instructions: str = field(repr=False)
 
 
@@ -105,5 +106,6 @@ def resolve(
         conversation_dir=conversation,
         read_dirs=(conversation, *projects),
         backend=known.backend or default_backend,
+        reply=rules.reply_mode(matched),
         instructions=instructions,
     )

@@ -8,6 +8,8 @@ Environment variables:
 - RULES_FILE: the rules file. Default /config/rules.yaml.
 - STATE_DIR: the folder of the state database and the heartbeat. Default /data.
 - LOG_LEVEL: DEBUG, INFO, WARNING or ERROR. Default INFO.
+- ALLOW_SEND: the kill switch for direct sending. Only `1` lets the listener post a reply of a
+  `send` rule; with anything else, or nothing, every such reply becomes a draft.
 
 Error messages name the variable but never quote its value: a mistyped MM_URL may hold a
 password, and a mistyped token is still most of a token.
@@ -42,6 +44,7 @@ class Settings:
     rules_file: Path
     state_dir: Path
     log_level: str
+    allow_send: bool = False
 
 
 def _check_url(url: str | None) -> str:
@@ -96,4 +99,5 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         rules_file=Path(env.get("RULES_FILE") or DEFAULT_RULES_FILE),
         state_dir=Path(env.get("STATE_DIR") or DEFAULT_STATE_DIR),
         log_level=_check_log_level(env.get("LOG_LEVEL")),
+        allow_send=env.get("ALLOW_SEND") == "1",
     )

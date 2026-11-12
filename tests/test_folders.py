@@ -5,7 +5,7 @@ import pytest
 from mattermost_agent.processor.folders import JobSetupError, Resolved, resolve
 from mattermost_agent.processor.scenarios import Scenario
 from mattermost_agent.processor.settings import Roots
-from mattermost_agent.rules import Bursts, Rule, RuleSet
+from mattermost_agent.rules import Bursts, Replies, ReplyMode, Rule, RuleSet
 
 CHANNEL = "k3d7w1q9m2n4p6r8t0v2x4z6a8"
 SCENARIOS = {
@@ -14,8 +14,13 @@ SCENARIOS = {
 }
 
 
-def rule(name: str = "dm", scenario: str = "intake", read: tuple[str, ...] = ()) -> Rule:
-    return Rule(name, scenario, True, frozenset(), frozenset(), read)
+def rule(
+    name: str = "dm",
+    scenario: str = "intake",
+    read: tuple[str, ...] = (),
+    reply: ReplyMode | None = None,
+) -> Rule:
+    return Rule(name, scenario, True, frozenset(), frozenset(), read, reply)
 
 
 def rules(*items: Rule) -> RuleSet:
@@ -55,6 +60,7 @@ def test_the_plain_case(roots: Roots) -> None:
     assert resolved.conversation_dir == roots.conversations / CHANNEL
     assert resolved.read_dirs == (roots.conversations / CHANNEL,)
     assert resolved.backend == "codex"
+    assert resolved.reply == "draft"
     assert resolved.instructions == "# intake\n"
     assert (resolved.conversation_dir.stat().st_mode & 0o777) == 0o700
     assert "intake\\n" not in repr(resolved)
@@ -68,6 +74,13 @@ def test_projects_are_attached_after_the_conversation(roots: Roots) -> None:
         roots.projects / "sales",
         roots.projects / "docs",
     )
+
+
+def test_the_rule_reply_mode_wins_over_the_default(roots: Roots) -> None:
+    local = RuleSet((rule(),), 20, Bursts(90, 600, 20), Replies(default="local"))
+    assert run(roots, rules=local).reply == "local"
+    own = RuleSet((rule(reply="draft"),), 20, Bursts(90, 600, 20), Replies(default="local"))
+    assert run(roots, rules=own).reply == "draft"
 
 
 def test_the_scenario_backend_wins_over_the_default(roots: Roots) -> None:
