@@ -6,7 +6,7 @@ FROM ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b98
 
 # Stage "build": installs the dependencies and the app into /app/.venv. uv, the lock file
 # and the build caches stay in this stage and never reach the final image.
-FROM python:3.15.2-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS build
+FROM python:3.16.0a2-slim@sha256:b743a8ab2708d630f1c1c008ef5c99d4b635ec16bb2012284f731d9957a14a1c AS build
 COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
 WORKDIR /app
@@ -19,7 +19,7 @@ RUN uv sync --locked --no-default-groups --no-editable
 
 # Final stage: the same Python base (the venv points at its interpreter), the venv, and a
 # non-root user. Nothing else.
-FROM python:3.15.2-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
+FROM python:3.16.0a2-slim@sha256:b743a8ab2708d630f1c1c008ef5c99d4b635ec16bb2012284f731d9957a14a1c
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app \
     && install -d -o 10001 -g 10001 -m 700 /data
 COPY --from=build /app/.venv /app/.venv
