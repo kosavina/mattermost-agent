@@ -24,7 +24,7 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.2.0",
     "ruff>=0.17.4",
-    "ty==0.0.99",
+    "ty==0.0.103",
 ]
 # The processor runs natively on the Mac and needs these; the listener's container does not, and
 # some of them (zstandard, through langgraph) have no Linux wheel for this Python, so the
